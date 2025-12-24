@@ -29,6 +29,8 @@ add_executable(unit_tests
     "src/handle.cpp"
     "src/loop.cpp"
     "src/ringbuffer.cpp"
+    "src/fs.cpp"
+    "src/udp.cpp"
     "src/watcher.cpp"
     "src/stream.cpp"
     "tests/main.cpp"
