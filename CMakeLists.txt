@@ -29,6 +29,7 @@ add_executable(unit_tests
     "src/handle.cpp"
     "src/loop.cpp"
     "src/ringbuffer.cpp"
+    "src/watcher.cpp"
     "src/stream.cpp"
     "tests/main.cpp"
 )
