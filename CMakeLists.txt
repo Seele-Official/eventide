@@ -32,6 +32,7 @@ add_executable(unit_tests
     "src/fs.cpp"
     "src/udp.cpp"
     "src/watcher.cpp"
+    "src/request.cpp"
     "src/stream.cpp"
     "tests/main.cpp"
 )
