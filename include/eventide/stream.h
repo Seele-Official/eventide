@@ -19,6 +19,9 @@ namespace eventide {
 template <typename Tag>
 struct awaiter;
 
+template <typename StreamT>
+class acceptor;
+
 class stream : public handle {
 protected:
     using handle::handle;
@@ -38,35 +41,36 @@ private:
     ring_buffer buffer;
 };
 
+template <typename Stream>
+class acceptor : public handle {
+private:
+    using handle::handle;
+
+    friend Stream;
+
+    template <typename Tag>
+    friend struct awaiter;
+
+public:
+    task<std::expected<Stream, std::error_code>> accept();
+
+private:
+    promise_base* waiter = nullptr;
+    std::expected<Stream, std::error_code>* active = nullptr;
+    std::deque<std::expected<Stream, std::error_code>> pending;
+};
+
 class pipe : public stream {
 private:
     using stream::stream;
 
 public:
-    class acceptor;
+    using acceptor = eventide::acceptor<pipe>;
 
     static std::expected<pipe, std::error_code> open(event_loop& loop, int fd);
     static std::expected<acceptor, std::error_code> listen(event_loop& loop,
                                                            const char* name,
                                                            int backlog = 128);
-
-    class acceptor : public handle {
-    private:
-        using handle::handle;
-
-        friend class pipe;
-
-        template <typename Tag>
-        friend struct awaiter;
-
-    public:
-        task<std::expected<pipe, std::error_code>> accept();
-
-    private:
-        promise_base* waiter = nullptr;
-        std::expected<pipe, std::error_code>* active = nullptr;
-        std::deque<std::expected<pipe, std::error_code>> pending;
-    };
 };
 
 class tcp_socket : public stream {
@@ -74,32 +78,15 @@ private:
     using stream::stream;
 
 public:
-    static std::expected<tcp_socket, std::error_code> open(event_loop& loop, int fd);
+    using acceptor = eventide::acceptor<tcp_socket>;
 
-    class acceptor;
+    static std::expected<tcp_socket, std::error_code> open(event_loop& loop, int fd);
 
     static std::expected<acceptor, std::error_code> listen(event_loop& loop,
                                                            std::string_view host,
                                                            int port,
                                                            unsigned int flags = 0,
                                                            int backlog = 128);
-
-    class acceptor : public handle {
-    private:
-        using handle::handle;
-        friend class tcp_socket;
-
-        template <typename Tag>
-        friend struct awaiter;
-
-    public:
-        task<std::expected<tcp_socket, std::error_code>> accept();
-
-    private:
-        promise_base* waiter = nullptr;
-        std::expected<tcp_socket, std::error_code>* active = nullptr;
-        std::deque<std::expected<tcp_socket, std::error_code>> pending;
-    };
 };
 
 class console : public stream {
