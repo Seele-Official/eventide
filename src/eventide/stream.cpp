@@ -234,8 +234,12 @@ struct stream_read_some_await : system_op {
 
         if(nread < 0) {
             aw->bytes = 0;
-        } else {
+        } else if(nread > 0) {
             aw->bytes = static_cast<std::size_t>(nread);
+        } else {
+            // nread=0 with no error means no data was read, but the stream is still alive (e.g.,
+            // EAGAIN).
+            return;
         }
 
         uv_read_stop(stream);
