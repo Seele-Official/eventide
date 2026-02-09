@@ -2,8 +2,9 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include "eventide/error.h"
+
 #include "zest/macro.h"
+#include "eventide/error.h"
 
 #ifdef _WIN32
 #include <BaseTsd.h>
@@ -362,19 +363,18 @@ TEST_CASE(connect_failure) {
     EXPECT_FALSE(client_res.has_value());
 }
 
-
 TEST_CASE(stop) {
     event_loop loop;
 
-    #ifdef _WIN32
-        const std::string name = "\\\\.\\pipe\\eventide-test-pipe-missing";
-    #else
-        std::string name = "eventide-test-pipe-missing-XXXXXX";
-        int fd = ::mkstemp(name.data());
-        ASSERT_TRUE(fd >= 0);
-        close_fd(fd);
-        ::unlink(name.c_str());
-    #endif
+#ifdef _WIN32
+    const std::string name = "\\\\.\\pipe\\eventide-test-pipe-missing";
+#else
+    std::string name = "eventide-test-pipe-missing-XXXXXX";
+    int fd = ::mkstemp(name.data());
+    ASSERT_TRUE(fd >= 0);
+    close_fd(fd);
+    ::unlink(name.c_str());
+#endif
 
     pipe::options opts{};
     opts.backlog = 16;
@@ -395,7 +395,6 @@ TEST_CASE(stop) {
 
     auto res1 = task1.value().value();
     EXPECT_TRUE(!res1.has_value() && res1.error() == error::operation_aborted);
-
 
     auto task2 = [](acceptor<pipe>& acc) -> eventide::task<result<pipe>> {
         event_loop::current().stop();

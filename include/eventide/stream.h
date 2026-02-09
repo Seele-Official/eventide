@@ -105,8 +105,8 @@ public:
     /// Accept one connection; only one pending accept is allowed at a time.
     task<result<Stream>> accept();
 
-    /// Stop pending accept which will complete with error::operation_aborted. If no accept is pending, the next
-    /// accept() will complete with error instead.
+    /// Stop pending accept which will complete with error::operation_aborted. If no accept is
+    /// pending, the next accept() will complete with error instead.
     error stop();
 
 private:
