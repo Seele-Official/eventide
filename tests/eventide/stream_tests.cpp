@@ -2,6 +2,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include "zest/macro.h"
 
 #ifdef _WIN32
 #include <BaseTsd.h>
@@ -176,10 +177,10 @@ task<error> connect_and_write_pipe(std::string_view name, std::string_view paylo
 
     auto conn = std::move(*conn_res);
     std::span<const char> data(payload.data(), payload.size());
-    co_await conn.write(data);
+    auto err = co_await conn.write(data);
 
     bump_and_stop(done, 2);
-    co_return error{};
+    co_return err;
 }
 
 task<result<std::string>> accept_and_read(tcp_socket::acceptor acc) {
@@ -219,10 +220,10 @@ task<error> connect_and_send(std::string_view host, int port, std::string_view p
 
     auto conn = std::move(*conn_res);
     std::span<const char> data(payload.data(), payload.size());
-    co_await conn.write(data);
+    auto err = co_await conn.write(data);
 
     bump_and_stop(done, 2);
-    co_return error{};
+    co_return err;
 }
 
 task<result<tcp_socket>> accept_once(tcp_socket::acceptor& acc, int& done) {
@@ -358,6 +359,39 @@ TEST_CASE(connect_failure) {
 
     auto client_res = client.result();
     EXPECT_FALSE(client_res.has_value());
+}
+
+
+TEST_CASE(stop) {
+    event_loop loop;
+
+    #ifdef _WIN32
+        const std::string name = "\\\\.\\pipe\\eventide-test-pipe-missing";
+    #else
+        std::string name = "eventide-test-pipe-missing-XXXXXX";
+        int fd = ::mkstemp(name.data());
+        ASSERT_TRUE(fd >= 0);
+        close_fd(fd);
+        ::unlink(name.c_str());
+    #endif
+
+    pipe::options opts{};
+    opts.backlog = 16;
+    auto acc = pipe::listen(name, opts, loop);
+    ASSERT_TRUE(acc.has_value());
+
+    acc->stop();
+
+    auto task = [&]() -> eventide::task<bool> {
+        auto res = co_await acc->accept();
+        EXPECT_TRUE(res.has_value() && res.error() == error::operation_aborted);
+        co_return true;
+    }();
+
+    loop.schedule(task);
+    loop.run();
+
+    EXPECT_TRUE(task.result());
 }
 
 };  // TEST_SUITE(pipe)

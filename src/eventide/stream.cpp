@@ -12,6 +12,7 @@
 
 #include "libuv.h"
 #include "ringbuffer.h"
+#include "eventide/error.h"
 #include "eventide/loop.h"
 
 namespace eventide {
@@ -278,11 +279,12 @@ struct stream_read_some_await : system_op {
 };
 
 struct stream_write_await : system_op {
-    using promise_t = task<>::promise_type;
+    using promise_t = task<error>::promise_type;
 
     stream::Self* self;
     std::vector<char> storage;
     uv_write_t req{};
+    error error_code{};
 
     stream_write_await(stream::Self* state, std::span<const char> data) :
         self(state), storage(data.begin(), data.end()) {
@@ -296,10 +298,14 @@ struct stream_write_await : system_op {
         }
     }
 
-    static void on_write(uv_write_t* req, int) {
+    static void on_write(uv_write_t* req, int status) {
         auto* aw = static_cast<stream_write_await*>(req->data);
         if(!aw || !aw->self) {
             return;
+        }
+
+        if(status < 0) {
+            aw->error_code = error(status);
         }
 
         if(aw->self->writer) {
@@ -334,10 +340,11 @@ struct stream_write_await : system_op {
         return link_continuation(&waiting.promise(), location);
     }
 
-    void await_resume() noexcept {
+    error await_resume() noexcept {
         if(self) {
             self->writer = nullptr;
         }
+        return this->error_code;
     }
 };
 
@@ -762,17 +769,17 @@ void stream::consume(std::size_t n) {
     self->buffer.advance_read(n);
 }
 
-task<> stream::write(std::span<const char> data) {
+task<error> stream::write(std::span<const char> data) {
     if(!self || !self->initialized() || data.empty()) {
-        co_return;
+        co_return error::invalid_argument;
     }
 
     if(self->writer != nullptr) {
         assert(false && "stream::write supports a single writer at a time");
-        co_return;
+        co_return error::invalid_argument;
     }
 
-    co_await stream_write_await{self.get(), data};
+    co_return co_await stream_write_await{self.get(), data};
 }
 
 result<std::size_t> stream::try_write(std::span<const char> data) {
@@ -871,6 +878,18 @@ task<result<Stream>> acceptor<Stream>::accept() {
     } else {
         co_return co_await tcp_accept_await{self.get()};
     }
+}
+
+template <typename Stream>
+error acceptor<Stream>::stop() {
+    if(!self) {
+        return error::invalid_argument;
+    }
+
+    result<Stream> error_result = std::unexpected(error::operation_aborted);
+    detail::deliver_or_queue(self->waiter, self->active, self->pending, std::move(error_result));
+
+    return {};
 }
 
 template <typename Stream>
