@@ -19,7 +19,7 @@ std::string_view error::message() const {
     return "unknown error";
 }
 
-constexpr error error::operation_aborted{-114514};
+const error error::operation_aborted{-114514};
 
 const error error::argument_list_too_long{UV_E2BIG};
 const error error::permission_denied{UV_EACCES};
