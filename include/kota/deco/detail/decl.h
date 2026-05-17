@@ -17,7 +17,7 @@
 
 #include "text.h"
 #include "trait.h"
-#include "kota/codec/detail/spelling.h"
+#include "kota/support/spelling.h"
 
 namespace kota::deco::decl {
 

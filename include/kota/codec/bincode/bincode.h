@@ -1,39 +1,31 @@
 #pragma once
 
-#include "kota/codec/bincode/deserializer.h"
-#include "kota/codec/bincode/error.h"
-#include "kota/codec/bincode/serializer.h"
-#include "kota/codec/detail/raw_value.h"
+#include "kota/codec/bincode/decode.h"
+#include "kota/codec/bincode/encode.h"
+#include "kota/codec/bincode/type.h"
+#include "kota/codec/visit/common.h"
 
 namespace kota::codec {
 
 template <typename Config>
-struct serialize_traits<bincode::Serializer<Config>, RawValue> {
-    using value_type = typename bincode::Serializer<Config>::value_type;
-    using error_type = typename bincode::Serializer<Config>::error_type;
-
-    static auto serialize(bincode::Serializer<Config>& serializer, const RawValue& value)
-        -> std::expected<value_type, error_type> {
+struct serialize_visit<bincode::writer, RawValue, Config> {
+    static bool visit(bincode::writer& vis, const RawValue& value) {
         auto bytes =
             std::span<const std::byte>(reinterpret_cast<const std::byte*>(value.data.data()),
                                        value.data.size());
-        return serializer.serialize_bytes(bytes);
+        return vis.visit_bytes(bytes);
     }
 };
 
 template <typename Config>
-struct deserialize_traits<bincode::Deserializer<Config>, RawValue> {
-    using error_type = typename bincode::Deserializer<Config>::error_type;
-
-    static auto deserialize(bincode::Deserializer<Config>& deserializer, RawValue& value)
-        -> std::expected<void, error_type> {
+struct deserialize_visit<bincode::reader, RawValue, Config> {
+    static bool visit(bincode::reader& vis, RawValue& value) {
         std::vector<std::byte> bytes;
-        auto status = deserializer.deserialize_bytes(bytes);
-        if(!status) {
-            return std::unexpected(status.error());
+        if(!vis.visit_bytes(bytes)) {
+            return false;
         }
         value.data.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-        return {};
+        return true;
     }
 };
 

@@ -13,7 +13,7 @@
 #include <vector>
 
 #include "kota/ipc/protocol.h"
-#include "kota/codec/detail/codec.h"
+#include "kota/codec/visit/encode.h"
 
 namespace kota::ipc::protocol {
 
@@ -97,33 +97,24 @@ namespace protocol = kota::ipc::protocol;
 
 namespace kota::codec {
 
-template <serializer_like S>
-struct serialize_traits<S, kota::ipc::protocol::LSPAny> {
-    using value_type = typename S::value_type;
-    using error_type = typename S::error_type;
-
-    static auto serialize(S& serializer, const kota::ipc::protocol::LSPAny& value)
-        -> std::expected<value_type, error_type> {
-        const auto& variant = static_cast<const kota::ipc::protocol::LSPVariant&>(value);
-        return std::visit([&](const auto& item) { return codec::serialize(serializer, item); },
-                          variant);
+template <typename Vis, typename Config>
+struct serialize_visit<Vis, kota::ipc::protocol::LSPAny, Config> {
+    static bool visit(Vis& vis, const kota::ipc::protocol::LSPAny& value) {
+        const auto& var = static_cast<const kota::ipc::protocol::LSPVariant&>(value);
+        return std::visit([&](const auto& item) -> bool { return encode_value<Config>(vis, item); },
+                          var);
     }
 };
 
-template <deserializer_like D>
-struct deserialize_traits<D, kota::ipc::protocol::LSPAny> {
-    using error_type = typename D::error_type;
-
-    static auto deserialize(D& deserializer, kota::ipc::protocol::LSPAny& value)
-        -> std::expected<void, error_type> {
+template <typename Vis, typename Config>
+struct deserialize_visit<Vis, kota::ipc::protocol::LSPAny, Config> {
+    static bool visit(Vis& vis, kota::ipc::protocol::LSPAny& value) {
         kota::ipc::protocol::LSPVariant variant{};
-        auto status = codec::deserialize(deserializer, variant);
-        if(!status) {
-            return std::unexpected(status.error());
-        }
+        if(!decode_value<Config>(vis, variant))
+            return false;
         std::visit([&](auto&& item) { value = std::forward<decltype(item)>(item); },
                    std::move(variant));
-        return {};
+        return true;
     }
 };
 

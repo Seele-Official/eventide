@@ -5,40 +5,26 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <utility>
 
-#include "kota/codec/content/deserializer.h"
-#include "kota/codec/content/document.h"
-#include "kota/codec/content/serializer.h"
-#include "kota/codec/detail/config.h"
-#include "kota/codec/detail/raw_value.h"
-#include "kota/codec/json/deserializer.h"
-#include "kota/codec/json/error.h"
-#include "kota/codec/json/serializer.h"
+#include "kota/codec/json/decode.h"
+#include "kota/codec/json/encode.h"
+#include "kota/codec/json/type.h"
+#include "kota/codec/visit/common.h"
 
 namespace kota::codec::json {
 
-// DOM type aliases (shared with content backend)
-using ValueKind = content::ValueKind;
-using Cursor = content::Cursor;
-using Value = content::Value;
-using Array = content::Array;
-using Object = content::Object;
-
-// Top-level convenience API (uses streaming simdjson backend by default)
-
-template <typename Config = config::default_config, typename T>
-auto parse(std::string_view json, T& value) -> std::expected<void, error> {
+template <typename Config = void, typename T>
+auto parse(std::string_view json, T& value) -> std::expected<void, rich_error> {
     return from_json<Config>(json, value);
 }
 
-template <typename T, typename Config = config::default_config>
+template <typename T, typename Config = void>
     requires std::default_initializable<T>
-auto parse(std::string_view json) -> std::expected<T, error> {
-    return from_json<T, Config>(json);
+auto parse(std::string_view json) -> std::expected<T, rich_error> {
+    return from_json<Config, T>(json);
 }
 
-template <typename Config = config::default_config, typename T>
+template <typename Config = void, typename T>
 auto to_string(const T& value, std::optional<std::size_t> initial_capacity = std::nullopt)
     -> std::expected<std::string, error> {
     return to_json<Config>(value, initial_capacity);
@@ -49,7 +35,7 @@ inline std::expected<std::string, error> prettify(std::string_view json) {
     simdjson::dom::element doc;
     auto padded = simdjson::padded_string(json);
     if(auto err = parser.parse(padded).get(doc)) {
-        return std::unexpected(error(make_error(err)));
+        return std::unexpected(rich_error(std::string(error_message(make_error(err)))));
     }
     return simdjson::prettify(doc);
 }
@@ -59,31 +45,27 @@ inline std::expected<std::string, error> prettify(std::string_view json) {
 namespace kota::codec {
 
 template <typename Config>
-struct serialize_traits<json::Serializer<Config>, RawValue> {
-    using value_type = typename json::Serializer<Config>::value_type;
-    using error_type = typename json::Serializer<Config>::error_type;
-
-    static auto serialize(json::Serializer<Config>& serializer, const RawValue& value)
-        -> std::expected<value_type, error_type> {
+struct serialize_visit<json::ValueWriter, RawValue, Config> {
+    static bool visit(json::ValueWriter& vis, const RawValue& value) {
         if(value.empty()) {
-            return serializer.serialize_null();
+            return vis.visit_null();
         }
-        return serializer.serialize_raw_json(value.data);
+        vis.builder.append_raw(value.data);
+        return true;
     }
 };
 
 template <typename Config>
-struct deserialize_traits<json::Deserializer<Config>, RawValue> {
-    using error_type = typename json::Deserializer<Config>::error_type;
-
-    static auto deserialize(json::Deserializer<Config>& deserializer, RawValue& value)
-        -> std::expected<void, error_type> {
-        auto raw = deserializer.deserialize_raw_json_view();
-        if(!raw) {
-            return std::unexpected(raw.error());
-        }
-        value.data.assign(raw->data(), raw->size());
-        return {};
+struct deserialize_visit<json::Reader, RawValue, Config> {
+    static bool visit(json::Reader& vis, RawValue& value) {
+        simdjson::ondemand::json_type t;
+        if(vis.apply([&](auto& s) { return s.type().get(t); }) != simdjson::SUCCESS)
+            return scoped_context<rich_error>::fail(rich_error("failed to read JSON value type"));
+        std::string_view raw;
+        if(vis.apply([&](auto& s) { return s.raw_json().get(raw); }) != simdjson::SUCCESS)
+            return scoped_context<rich_error>::fail(rich_error("failed to read raw JSON value"));
+        value.data.assign(raw.data(), raw.size());
+        return true;
     }
 };
 
