@@ -192,7 +192,6 @@ if has_config("ztest") then
 		add_rules("cl-flags")
 		add_deps("support", "deco")
 		add_packages("cpptrace", { public = true })
-		add_defines('KOTA_ZEST_BUILD_ROOT="' .. os.projectdir():gsub("\\", "/") .. '"')
 	end)
 end
 
@@ -352,6 +351,7 @@ if has_config("test") and has_config("ztest") then
 	target("unit_tests", function()
 		set_default(false)
 		set_kind("binary")
+		set_rundir("$(projectdir)")
 		add_rules("cl-flags")
 		add_includedirs("tests")
 		add_files(
