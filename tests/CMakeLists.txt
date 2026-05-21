@@ -201,4 +201,7 @@ if(KOTA_SANITIZE_ADDRESS AND MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         endif()
     endforeach()
 endif()
-add_test(NAME unit_tests COMMAND unit_tests WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+add_test(NAME unit_tests COMMAND unit_tests
+    "--snapshot-dir=tests/snapshots"
+    WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
