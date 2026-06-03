@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cassert>
 #include <coroutine>
 #include <cstddef>
@@ -7,9 +8,7 @@
 #include <cstdlib>
 #include <exception>
 #include <limits>
-#include <set>
 #include <source_location>
-#include <string>
 #include <vector>
 
 #include "kota/support/config.h"
@@ -18,24 +17,17 @@ namespace kota {
 
 class sync_primitive;
 
-namespace detail {
-
-/// Resume a coroutine and immediately drain any deferred root-frame destruction.
-void resume_and_drain(std::coroutine_handle<> handle);
-
-}  // namespace detail
-
 /// Type-erased base for all coroutine-related nodes in the task tree.
 ///
 /// This hierarchy models awaitable runtime entities only.
 /// Shared sync resources (mutex/event/semaphore/cv) live outside it and are
-/// referenced by waiter_link nodes while a task is blocked on them.
+/// referenced by wait_node nodes while a task is blocked on them.
 class async_node {
 public:
     enum class NodeKind : std::uint8_t {
         Task,
 
-        /// Wait queue entries — waiter_link subclasses.
+        /// Wait queue entries — wait_node subclasses.
         /// Semaphore and CV reuse EventWaiter (identical cancel semantics).
         MutexWaiter,
         EventWaiter,
@@ -73,15 +65,13 @@ public:
 
     State state = Pending;
 
-    bool root = false;
-
     std::source_location location;
 
-    bool is_standard_task() const noexcept {
+    bool is_task_frame() const noexcept {
         return kind == NodeKind::Task;
     }
 
-    bool is_waiter_link() const noexcept {
+    bool is_wait_node() const noexcept {
         return NodeKind::MutexWaiter <= kind && kind <= NodeKind::EventWaiter;
     }
 
@@ -106,32 +96,20 @@ public:
     // https://github.com/llvm/llvm-project/issues/105595. Fixed in clang 21.
     void intercept_cancel() noexcept;
 
-    /// If this node is a task, clear its awaitee pointer.
-    void clear_awaitee() noexcept;
+    /// If this node is a task, clear its child pointer.
+    void clear_child() noexcept;
 
     void cancel();
 
     void resume();
 
-    std::coroutine_handle<> link_continuation(async_node* awaiter, std::source_location location);
+    std::coroutine_handle<> attach(async_node& parent, std::source_location location);
 
-    std::coroutine_handle<> final_transition();
+    std::coroutine_handle<> finalize();
 
-    std::coroutine_handle<> handle_subtask_result(async_node* parent);
+    std::coroutine_handle<> on_child_complete(async_node& child);
 
-    /// Dump the async graph reachable from this node as a DOT (graphviz) graph.
-    std::string dump_dot() const;
-
-private:
-    const static async_node* get_awaiter(const async_node* node);
-    const static sync_primitive* get_resource_parent(const async_node* node);
-
-    static void dump_dot_walk(const async_node* node,
-                              std::set<const void*>& visited,
-                              std::string& out);
-    static void dump_dot_walk(const sync_primitive* resource,
-                              std::set<const void*>& visited,
-                              std::string& out);
+    static void resume_and_drain(std::coroutine_handle<> handle);
 
 protected:
     explicit async_node(NodeKind k) : kind(k) {}
@@ -140,33 +118,30 @@ public:
     std::exception_ptr propagated_exception;
 };
 
-class standard_task : public async_node {
+class task_frame : public async_node {
 protected:
     friend class async_node;
 
-    explicit standard_task() : async_node(NodeKind::Task) {}
+    explicit task_frame() : async_node(NodeKind::Task) {}
 
 public:
+    bool root = false;
+
     /// Optional hook invoked when a child task fails, allowing the parent to
     /// intercept the error before normal resumption. Used by or_fail_task_await
     /// to propagate errors directly without resuming the parent coroutine.
-    using error_hook = std::coroutine_handle<> (*)(async_node* child, async_node* parent);
+    using error_hook = std::coroutine_handle<> (*)(async_node& child, async_node& parent);
 
     std::coroutine_handle<> handle() {
         return std::coroutine_handle<>::from_address(address);
     }
 
-    bool has_awaitee() const noexcept {
-        return awaitee != nullptr;
+    bool has_child() const noexcept {
+        return child != nullptr;
     }
 
-    void detach_as_root() noexcept {
-        awaiter = nullptr;
-        root = true;
-    }
-
-    void set_awaitee(async_node* node) noexcept {
-        awaitee = node;
+    void set_child(async_node* node) noexcept {
+        child = node;
     }
 
     void set_error_hook(error_hook fn) noexcept {
@@ -179,6 +154,14 @@ public:
 
     void clear_error_hook() noexcept {
         error_hook_fn = nullptr;
+    }
+
+    const async_node* get_parent() const noexcept {
+        return parent;
+    }
+
+    const async_node* get_child() const noexcept {
+        return child;
     }
 
 protected:
@@ -195,22 +178,31 @@ protected:
     void* address = nullptr;
 
 private:
-    /// The node that awaits this task currently, if it is empty,
-    /// this task is a top level task. It was launched by eventloop.
-    async_node* awaiter = nullptr;
+    async_node* parent = nullptr;
 
-    /// The node that this task awaits.
-    async_node* awaitee = nullptr;
+    async_node* child = nullptr;
 
     error_hook error_hook_fn = nullptr;
 };
 
-class waiter_link : public async_node {
+class wait_node : public async_node {
 public:
     friend class async_node;
     friend class sync_primitive;
 
-    explicit waiter_link(NodeKind k) : async_node(k) {}
+    explicit wait_node(NodeKind k) : async_node(k) {}
+
+    const async_node* get_parent() const noexcept {
+        return parent;
+    }
+
+    const sync_primitive* get_resource() const noexcept {
+        return resource;
+    }
+
+    const wait_node* get_next() const noexcept {
+        return next;
+    }
 
 protected:
     /// The sync_primitive this waiter is queued on (nullptr if not queued).
@@ -228,11 +220,10 @@ protected:
     std::size_t generation = 0;
 
     /// Intrusive doubly-linked list pointers for the sync_primitive's wait queue.
-    waiter_link* prev = nullptr;
-    waiter_link* next = nullptr;
+    wait_node* prev = nullptr;
+    wait_node* next = nullptr;
 
-    /// The task that is suspended waiting for this waiter to be signalled.
-    async_node* awaiter = nullptr;
+    async_node* parent = nullptr;
 };
 
 /// Base for when_all / when_any.
@@ -240,7 +231,7 @@ protected:
 /// Uses a two-phase protocol in await_suspend:
 ///   1. Arming: link all children, then resume them. During this phase,
 ///      synchronous child completions are deferred instead of directly
-///      resuming the awaiter (to avoid use-after-resume).
+///      resuming the parent (to avoid use-after-resume).
 ///   2. Post-arm: deliver any deferred completion once it is safe.
 ///
 /// Aggregate state is tracked explicitly:
@@ -252,6 +243,15 @@ protected:
 
     explicit aggregate_op(NodeKind k) : async_node(k) {}
 
+public:
+    const async_node* get_parent() const noexcept {
+        return parent;
+    }
+
+    const std::vector<async_node*>& get_children() const noexcept {
+        return children;
+    }
+
 protected:
     enum class Phase : std::uint8_t {
         /// Normal operating state after arming completes.
@@ -260,7 +260,7 @@ protected:
 
         /// await_suspend is still linking/resuming children.
         /// Any child completion observed here must be deferred until
-        /// await_suspend returns to avoid resuming the awaiter re-entrantly.
+        /// await_suspend returns to avoid resuming the parent re-entrantly.
         Arming,
 
         /// The aggregate itself is propagating cancellation to children.
@@ -276,24 +276,20 @@ protected:
         /// No deferred completion is waiting to be delivered.
         None,
 
-        /// Resume the awaiter normally.
         Resume,
 
-        /// Resume the awaiter by propagating cancellation upward.
         Cancel,
 
-        /// Resume the awaiter by propagating failure upward.
+        /// Error outranks all other deferred outcomes.
         Error,
     };
 
     /// Sentinel value for when_any: no winner yet.
     constexpr static std::size_t npos = (std::numeric_limits<std::size_t>::max)();
 
-    /// The parent node that co_awaited this aggregate.
-    async_node* awaiter = nullptr;
+    async_node* parent = nullptr;
 
-    /// Child nodes managed by this aggregate (tasks spawned into it).
-    std::vector<async_node*> awaitees;
+    std::vector<async_node*> children;
 
     /// Number of children that have completed so far.
     std::size_t completed = 0;
@@ -344,6 +340,32 @@ protected:
         deferred = Deferred::Error;
     }
 
+    std::size_t find_child_index(const async_node& child) const {
+        auto it = std::ranges::find(children, &child);
+        assert(it != children.end() && "child not found in aggregate");
+        if(it == children.end())
+            std::abort();
+        return static_cast<std::size_t>(it - children.begin());
+    }
+
+    void cancel_siblings(async_node* exclude = nullptr) {
+        [[maybe_unused]] bool found = exclude == nullptr;
+        auto saved = phase;
+        phase = Phase::Cancelling;
+        for(auto* child: children) {
+            assert(child && "aggregate contains a null child");
+            if(child == exclude) {
+                found = true;
+                continue;
+            }
+            child->cancel();
+        }
+        assert(found && "cancel_siblings exclude is not a child of this aggregate");
+        if(phase == Phase::Cancelling) {
+            phase = saved;
+        }
+    }
+
     /// Rethrows the propagated exception if one was captured from a failed child.
     void rethrow_if_propagated() {
 #if KOTA_ENABLE_EXCEPTIONS
@@ -353,23 +375,18 @@ protected:
 #endif
     }
 
-    /// Deliver the latched completion to the aggregate awaiter once it is safe
+    /// Deliver the latched completion to the aggregate parent once it is safe
     /// to resume or propagate out of the current callback stack.
-    std::coroutine_handle<> deliver_deferred() noexcept;
+    std::coroutine_handle<> flush_deferred() noexcept;
 
-    /// Common await_suspend logic for all aggregate operations.
-    /// The caller must populate `awaitees` and set `total` before calling.
-    template <typename Promise>
-    std::coroutine_handle<> arm_and_resume(std::coroutine_handle<Promise> awaiter_handle,
-                                           std::source_location location) noexcept {
-        this->location = location;
+    std::coroutine_handle<> arm_and_resume(async_node& parent_node,
+                                           std::source_location loc) noexcept {
+        this->location = loc;
 
-        auto* awaiter_node = static_cast<async_node*>(&awaiter_handle.promise());
-        if(awaiter_node->kind == async_node::NodeKind::Task) {
-            static_cast<standard_task*>(awaiter_node)->set_awaitee(this);
-        }
+        assert(parent_node.is_task_frame() && "aggregate parent must be a task");
+        static_cast<task_frame*>(&parent_node)->set_child(this);
 
-        awaiter = awaiter_node;
+        parent = &parent_node;
         completed = 0;
         winner = npos;
         first_error_child = npos;
@@ -379,18 +396,16 @@ protected:
         propagated_exception = nullptr;
         state = Running;
 
-        for(auto* child: awaitees) {
-            if(child) {
-                child->link_continuation(this, location);
-            }
+        for(auto* child: children) {
+            assert(child && "aggregate contains a null child");
+            child->attach(*this, location);
         }
 
-        for(auto* child: awaitees) {
-            if(child) {
-                child->resume();
-                if(is_settled() || deferred != Deferred::None) {
-                    break;
-                }
+        for(auto* child: children) {
+            assert(child && "aggregate contains a null child");
+            child->resume();
+            if(is_settled() || deferred != Deferred::None) {
+                break;
             }
         }
 
@@ -398,69 +413,34 @@ protected:
             phase = Phase::Open;
         }
 
-        return deferred != Deferred::None ? deliver_deferred() : std::noop_coroutine();
+        assert(completed <= total && "aggregate completed more children than it owns");
+        if(completed == total && deferred != Deferred::None) {
+            return flush_deferred();
+        }
+
+        return std::noop_coroutine();
     }
 };
 
-class system_op : public async_node {
+class io_op : public async_node {
 protected:
     friend class async_node;
 
-    using on_cancel = void (*)(system_op* self);
+    using on_cancel = void (*)(io_op* self);
 
-    explicit system_op(NodeKind k = NodeKind::SystemIO) : async_node(k) {}
+    explicit io_op(NodeKind k = NodeKind::SystemIO) : async_node(k) {}
 
     /// Callback invoked when this operation is cancelled (e.g. to close a uv handle).
     on_cancel action = nullptr;
 
-    /// The parent node that is waiting for this I/O operation to complete.
-    async_node* awaiter = nullptr;
+    async_node* parent = nullptr;
 
 public:
     void complete() noexcept;
-};
 
-class task_group_node : public aggregate_op {
-protected:
-    friend class async_node;
-
-    explicit task_group_node() : aggregate_op(NodeKind::TaskGroup) {}
-
-    bool stopped = false;
-
-    using error_handler = void (*)(async_node* child, task_group_node* group);
-
-    std::vector<error_handler> error_handlers;
-
-    void cancel_children(async_node* exclude = nullptr) {
-        phase = Phase::Cancelling;
-        const std::size_t n = awaitees.size();
-        for(std::size_t i = 0; i < n; ++i) {
-            auto* child = awaitees[i];
-            if(child && child != exclude) {
-                child->cancel();
-            }
-        }
-        if(phase == Phase::Cancelling) {
-            phase = Phase::Open;
-        }
+    const async_node* get_parent() const noexcept {
+        return parent;
     }
 };
-
-namespace detail {
-
-inline void destroy_or_detach(async_node* child) noexcept {
-    assert(child && child->kind == async_node::NodeKind::Task);
-    auto* task = static_cast<standard_task*>(child);
-
-    if(task->has_awaitee()) {
-        task->detach_as_root();
-        return;
-    }
-
-    task->handle().destroy();
-}
-
-}  // namespace detail
 
 }  // namespace kota

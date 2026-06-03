@@ -14,7 +14,7 @@
 #include "kota/support/config.h"
 #include "kota/support/type_traits.h"
 #include "kota/async/io/loop.h"
-#include "kota/async/runtime/frame.h"
+#include "kota/async/runtime/node.h"
 #include "kota/async/vocab/awaitable.h"
 #include "kota/async/vocab/error.h"
 #include "kota/async/vocab/outcome.h"
@@ -120,7 +120,7 @@ struct transition_await {
         auto& promise = handle.promise();
         if(state == async_node::Finished) {
             if(promise.state == async_node::Cancelled || promise.state == async_node::Failed) {
-                return promise.final_transition();
+                return promise.finalize();
             }
             assert(promise.state == async_node::Running && "only running task could finish");
             if(promise.has_exception()) {
@@ -136,7 +136,7 @@ struct transition_await {
         } else {
             assert(false && "unexpected task state");
         }
-        return promise.final_transition();
+        return promise.finalize();
     }
 
     [[noreturn]] void await_resume() const noexcept {
@@ -227,7 +227,7 @@ struct or_fail_proxy {
     Task inner;
 };
 
-/// Error hook invoked by handle_subtask_result when a child task fails
+/// Error hook invoked by on_child_complete when a child task fails
 /// while an or_fail_task_await is active. Bypasses normal parent resumption
 /// by writing the child's error directly into the parent promise and
 /// transitioning the parent to Finished/Failed.
@@ -235,11 +235,11 @@ struct or_fail_proxy {
 /// If the child threw an exception instead, clears the hook and lets the
 /// parent resume normally so await_resume can rethrow via rethrow_if_exception.
 template <typename ParentPromise, typename ParentError, typename ChildTask>
-std::coroutine_handle<> propagate_fail(async_node* child_node, async_node* parent_node) {
-    auto* child = static_cast<typename ChildTask::promise_type*>(child_node);
-    auto* parent = static_cast<ParentPromise*>(parent_node);
-    auto* child_task = static_cast<standard_task*>(child_node);
-    auto* parent_task = static_cast<standard_task*>(parent_node);
+std::coroutine_handle<> propagate_fail(async_node& child_node, async_node& parent_node) {
+    auto* child = static_cast<typename ChildTask::promise_type*>(&child_node);
+    auto* parent = static_cast<ParentPromise*>(&parent_node);
+    auto* child_task = static_cast<task_frame*>(&child_node);
+    auto* parent_task = static_cast<task_frame*>(&parent_node);
 
     child_task->clear_error_hook();
 
@@ -252,7 +252,7 @@ std::coroutine_handle<> propagate_fail(async_node* child_node, async_node* paren
     assert(child->value.has_value() && child->value->has_error());
     parent->value.emplace(outcome_error(ParentError(std::move(*child->value).error())));
     parent_task->state = async_node::Failed;
-    return parent_task->final_transition();
+    return parent_task->finalize();
 }
 
 /// Awaitable for `co_await task.or_fail()`. Installs an error hook on the
@@ -267,11 +267,11 @@ struct or_fail_task_await {
         return inner.await_ready();
     }
 
-    auto await_suspend(std::coroutine_handle<ParentPromise> awaiter,
+    auto await_suspend(std::coroutine_handle<ParentPromise> h,
                        std::source_location location = std::source_location::current()) noexcept {
         inner.awaitee.h.promise().set_error_hook(
             &propagate_fail<ParentPromise, ParentError, ChildTask>);
-        return inner.await_suspend(awaiter, location);
+        return inner.await_suspend(h, location);
     }
 
     /// Only reached on success (error path is intercepted by the hook).
@@ -292,7 +292,7 @@ template <typename T, typename E>
 struct task_return_object;
 
 template <typename T, typename E>
-struct task_promise_object : standard_task, promise_result<T, E, void>, promise_exception {
+struct task_promise_object : task_frame, promise_result<T, E, void>, promise_exception {
     using coroutine_handle = std::coroutine_handle<task_promise_object>;
 
     using promise_result<T, E, void>::value;
@@ -401,9 +401,9 @@ public:
 
         template <typename Promise>
         auto await_suspend(
-            std::coroutine_handle<Promise> awaiter,
+            std::coroutine_handle<Promise> h,
             std::source_location location = std::source_location::current()) noexcept {
-            return awaitee.h.promise().link_continuation(&awaiter.promise(), location);
+            return awaitee.h.promise().attach(h.promise(), location);
         }
 
         auto await_resume() {
@@ -617,63 +617,5 @@ task_return_object<T, E>::operator task<T, E, cancellation>() && noexcept {
     handle = nullptr;
     return out;
 }
-
-namespace detail {
-
-template <typename T>
-constexpr inline bool is_task_v = is_specialization_of<task, std::remove_cvref_t<T>>;
-
-template <typename T>
-using normalized_await_result_t = await_result_t<std::remove_cvref_t<T>&&>;
-
-template <typename T, typename = void>
-struct normalized_task;
-
-template <typename T>
-struct normalized_task<T, std::enable_if_t<is_task_v<T>>> {
-    using type = std::remove_cvref_t<T>;
-};
-
-template <typename T>
-struct normalized_task<T, std::enable_if_t<!is_task_v<T> && awaitable<std::remove_cvref_t<T>&&>>> {
-    using type = task<normalized_await_result_t<T>>;
-};
-
-template <typename T>
-using normalized_task_t = typename normalized_task<T>::type;
-
-template <typename T, typename E, typename C>
-task<T, E, C> normalize_task(task<T, E, C>&& t) {
-    return std::move(t);
-}
-
-template <typename Awaitable>
-    requires (!is_task_v<Awaitable>) && (!std::is_reference_v<Awaitable>) &&
-             std::constructible_from<std::remove_cvref_t<Awaitable>, Awaitable&&> &&
-             awaitable<std::remove_cvref_t<Awaitable>&&>
-auto normalize_task_impl(std::remove_cvref_t<Awaitable> value)
-    -> task<normalized_await_result_t<Awaitable>> {
-    if constexpr(!std::is_void_v<normalized_await_result_t<Awaitable>>) {
-        co_return co_await std::move(value);
-    } else {
-        co_await std::move(value);
-    }
-}
-
-template <typename Awaitable>
-    requires (!is_task_v<Awaitable>) && (!std::is_reference_v<Awaitable>) &&
-             std::constructible_from<std::remove_cvref_t<Awaitable>, Awaitable&&> &&
-             awaitable<std::remove_cvref_t<Awaitable>&&>
-auto normalize_task(Awaitable&& input) -> task<normalized_await_result_t<Awaitable>> {
-    return normalize_task_impl<Awaitable>(
-        std::remove_cvref_t<Awaitable>(std::forward<Awaitable>(input)));
-}
-
-template <typename T, typename E, typename C>
-async_node* node_from(task<T, E, C>& t) {
-    return t.operator->();
-}
-
-}  // namespace detail
 
 }  // namespace kota

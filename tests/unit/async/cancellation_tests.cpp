@@ -200,9 +200,11 @@ TEST_CASE(queue_cancel_resume, serial = true) {
     loop.run();
 
     EXPECT_TRUE(target_cancelled);
-    // Event-based cancellation is synchronous: the target resumes within
-    // source.cancel(), before phase is advanced to 2.
-    EXPECT_EQ(observed_phase, 1);
+    // Structured completion: with_token uses when_any internally, which
+    // now waits for all children (including the cancelled inner task).
+    // The target resumes after source.cancel() returns and the event
+    // loop completes the cancellation, so phase has already advanced to 2.
+    EXPECT_EQ(observed_phase, 2);
     EXPECT_FALSE(target_started.load(std::memory_order_acquire));
 }
 
@@ -283,7 +285,9 @@ TEST_CASE(fs_cancel_resume, serial = true) {
     loop.run();
 
     EXPECT_TRUE(target_cancelled);
-    EXPECT_EQ(observed_phase, 1);
+    // Structured completion: target resumes after the cancelled fs::stat
+    // completes via the event loop, so phase has already advanced to 2.
+    EXPECT_EQ(observed_phase, 2);
 }
 
 TEST_CASE(cancel_waiting_on_event) {
@@ -327,14 +331,14 @@ TEST_CASE(wait_sync_primitive) {
     auto blocked = worker();
     blocked->resume();
 
-    auto waiting_dot = blocked->dump_dot();
+    auto waiting_dot = dump_dot(blocked);
     EXPECT_NE(waiting_dot.find("Task"), std::string::npos);
     EXPECT_NE(waiting_dot.find("EventWaiter"), std::string::npos);
     EXPECT_NE(waiting_dot.find("Event"), std::string::npos);
 
     blocked->cancel();
 
-    auto cancelled_dot = blocked->dump_dot();
+    auto cancelled_dot = dump_dot(blocked);
     EXPECT_EQ(cancelled_dot.find("EventWaiter"), std::string::npos);
 
     gate.set();

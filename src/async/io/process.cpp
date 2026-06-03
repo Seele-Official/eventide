@@ -1,6 +1,7 @@
 #include "kota/async/io/process.h"
 
 #include <cassert>
+#include <csignal>
 
 #include "awaiter.h"
 #include "kota/async/io/loop.h"
@@ -50,12 +51,12 @@ struct process_await : uv::await_op<process_await> {
 
     explicit process_await(process::Self* self) : self(self) {}
 
-    static void on_cancel(system_op* op) {
-        await_base::complete_cancel(op, [](auto& aw) {
-            if(aw.self) {
-                aw.self->disarm();
-            }
-        });
+    static void on_cancel(io_op* op) {
+        auto* aw = static_cast<process_await*>(op);
+        if(aw && aw->self) {
+            aw->state = async_node::Cancelled;
+            uv::process_kill(aw->self->handle, SIGKILL);
+        }
     }
 
     static void notify(process::Self& self, process::exit_status status) {
@@ -73,7 +74,7 @@ struct process_await : uv::await_op<process_await> {
             return waiting;
         }
         self->arm(*this, result);
-        return this->link_continuation(&waiting.promise(), loc);
+        return this->attach(waiting.promise(), loc);
     }
 
     process::wait_result await_resume() noexcept {

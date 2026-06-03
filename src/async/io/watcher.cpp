@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <type_traits>
 
 #include "awaiter.h"
 #include "kota/async/io/loop.h"
@@ -11,31 +12,31 @@ namespace kota {
 
 struct timer::Self : uv::handle<timer::Self, uv_timer_t> {
     uv_timer_t handle{};
-    system_op* waiter = nullptr;
+    io_op* waiter = nullptr;
     int pending = 0;
 };
 
 struct idle::Self : uv::handle<idle::Self, uv_idle_t> {
     uv_idle_t handle{};
-    system_op* waiter = nullptr;
+    io_op* waiter = nullptr;
     int pending = 0;
 };
 
 struct prepare::Self : uv::handle<prepare::Self, uv_prepare_t> {
     uv_prepare_t handle{};
-    system_op* waiter = nullptr;
+    io_op* waiter = nullptr;
     int pending = 0;
 };
 
 struct check::Self : uv::handle<check::Self, uv_check_t> {
     uv_check_t handle{};
-    system_op* waiter = nullptr;
+    io_op* waiter = nullptr;
     int pending = 0;
 };
 
 struct signal::Self : uv::handle<signal::Self, uv_signal_t> {
     uv_signal_t handle{};
-    system_op* waiter = nullptr;
+    io_op* waiter = nullptr;
     error* active = nullptr;
     int pending = 0;
 };
@@ -52,9 +53,18 @@ struct basic_tick_await : uv::await_op<basic_tick_await<SelfT, HandleT>> {
 
     explicit basic_tick_await(SelfT* watcher) : self(watcher) {}
 
-    static void on_cancel(system_op* op) {
+    static void on_cancel(io_op* op) {
         await_base::complete_cancel(op, [](auto& aw) {
             if(aw.self) {
+                if constexpr(std::is_same_v<HandleT, uv_timer_t>) {
+                    uv::timer_stop(aw.self->handle);
+                } else if constexpr(std::is_same_v<HandleT, uv_idle_t>) {
+                    uv::idle_stop(aw.self->handle);
+                } else if constexpr(std::is_same_v<HandleT, uv_prepare_t>) {
+                    uv::prepare_stop(aw.self->handle);
+                } else if constexpr(std::is_same_v<HandleT, uv_check_t>) {
+                    uv::check_stop(aw.self->handle);
+                }
                 aw.self->waiter = nullptr;
             }
         });
@@ -84,7 +94,7 @@ struct basic_tick_await : uv::await_op<basic_tick_await<SelfT, HandleT>> {
             return waiting;
         }
         self->waiter = this;
-        return this->link_continuation(&waiting.promise(), loc);
+        return this->attach(waiting.promise(), loc);
     }
 
     void await_resume() noexcept {
@@ -114,9 +124,10 @@ struct signal_await : uv::await_op<signal_await> {
 
     explicit signal_await(signal::Self* watcher) : self(watcher) {}
 
-    static void on_cancel(system_op* op) {
+    static void on_cancel(io_op* op) {
         await_base::complete_cancel(op, [](auto& aw) {
             if(aw.self) {
+                uv::signal_stop(aw.self->handle);
                 aw.self->waiter = nullptr;
                 aw.self->active = nullptr;
             }
@@ -152,7 +163,7 @@ struct signal_await : uv::await_op<signal_await> {
         }
         self->waiter = this;
         self->active = &result;
-        return this->link_continuation(&waiting.promise(), loc);
+        return this->attach(waiting.promise(), loc);
     }
 
     error await_resume() noexcept {
