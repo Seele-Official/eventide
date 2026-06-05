@@ -7,9 +7,9 @@
 #include <type_traits>
 #include <vector>
 
-#include "./config.h"
-#include "./decl.h"
-#include "./ty.h"
+#include "config.h"
+#include "decl.h"
+#include "ty.h"
 #include "kota/support/spelling.h"
 
 /*

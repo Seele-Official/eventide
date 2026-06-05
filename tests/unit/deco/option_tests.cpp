@@ -1,11 +1,11 @@
 #include <array>
 #include <expected>
-#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "test_util.h"
 #include "kota/deco/option.h"
 #include "kota/zest/zest.h"
 
@@ -13,32 +13,9 @@ namespace kota::option {
 namespace {
 
 using namespace std::literals::string_view_literals;
-
-std::vector<std::string> split2vec(std::string_view str) {
-    auto views = std::views::split(str, ' ') | std::views::transform([](auto&& rng) {
-                     return std::string(rng.begin(), rng.end());
-                 });
-    return std::vector<std::string>(views.begin(), views.end());
-}
-
-struct ParseCapture {
-    std::vector<std::string> argv;
-    std::vector<ParsedArg> args;
-    std::vector<ParseError> errors;
-};
-
-ParseCapture parse_all(const OptTable& table, std::vector<std::string> argv) {
-    ParseCapture capture;
-    capture.argv = std::move(argv);
-    for(auto& result: table.parse(capture.argv)) {
-        if(result.has_value()) {
-            capture.args.push_back(*result);
-        } else {
-            capture.errors.push_back(result.error());
-        }
-    }
-    return capture;
-}
+using test::parse_all;
+using test::ParseCapture;
+using test::split2vec;
 
 enum MainOptionID {
     MAIN_OPT_INVALID = 0,
@@ -50,37 +27,23 @@ enum MainOptionID {
 };
 
 constexpr auto kMainOptInfos = std::array{
-    OptTableInfo::input(MAIN_OPT_INPUT),
-    OptTableInfo::unknown(MAIN_OPT_UNKNOWN),
-    OptTableInfo::unaliased_one(pfx_double,
-                                "--help",
-                                MAIN_OPT_HELP,
-                                Kind::Flag,
-                                0,
-                                "Display help",
-                                ""),
-    OptTableInfo::unaliased_one(pfx_dash,
-                                "-h",
-                                MAIN_OPT_HELP_SHORT,
-                                Kind::Flag,
-                                0,
-                                "Display help",
-                                "")
+    Option::input(MAIN_OPT_INPUT),
+    Option::unknown(MAIN_OPT_UNKNOWN),
+    Option::unaliased_one(pfx_double, "--help", MAIN_OPT_HELP, Kind::Flag, 0, "Display help", ""),
+    Option::unaliased_one(pfx_dash, "-h", MAIN_OPT_HELP_SHORT, Kind::Flag, 0, "Display help", "")
         .alias_of(MAIN_OPT_HELP),
-    OptTableInfo::unaliased_one(pfx_dash,
-                                "-s",
-                                MAIN_OPT_SCRIPT,
-                                Kind::Separate,
-                                1,
-                                "Script path",
-                                ""),
+    Option::unaliased_one(pfx_dash, "-s", MAIN_OPT_SCRIPT, Kind::Separate, 1, "Script path", ""),
 };
 
 OptTable make_main_opt_table() {
-    return OptTable(std::span<const OptTableInfo>(kMainOptInfos))
-        .set_tablegen_mode(false)
-        .set_dash_dash_parsing(true)
-        .set_dash_dash_as_single_pack(true);
+    return OptTable(std::span<const Option>(kMainOptInfos));
+}
+
+ParseOptions make_main_parse_options() {
+    ParseOptions opts;
+    opts.dash_dash_parsing = true;
+    opts.dash_dash_as_single_pack = true;
+    return opts;
 }
 
 enum ProxyOptionID {
@@ -92,38 +55,39 @@ enum ProxyOptionID {
 };
 
 constexpr auto kProxyOptInfos = std::array{
-    OptTableInfo::input(PROXY_OPT_INPUT),
-    OptTableInfo::unknown(PROXY_OPT_UNKNOWN),
-    OptTableInfo::unaliased_one(pfx_dash,
-                                "-p",
-                                PROXY_OPT_PARENT_ID,
-                                Kind::Separate,
-                                1,
-                                "Parent process id",
-                                ""),
-    OptTableInfo::unaliased_one(pfx_dash_double,
-                                "--exec",
-                                PROXY_OPT_EXEC,
-                                Kind::Separate,
-                                1,
-                                "Exec",
-                                ""),
+    Option::input(PROXY_OPT_INPUT),
+    Option::unknown(PROXY_OPT_UNKNOWN),
+    Option::unaliased_one(pfx_dash,
+                          "-p",
+                          PROXY_OPT_PARENT_ID,
+                          Kind::Separate,
+                          1,
+                          "Parent process id",
+                          ""),
+    Option::unaliased_one(pfx_dash_double, "--exec", PROXY_OPT_EXEC, Kind::Separate, 1, "Exec", ""),
 };
 
 OptTable make_proxy_opt_table() {
-    return OptTable(std::span<const OptTableInfo>(kProxyOptInfos))
-        .set_tablegen_mode(false)
-        .set_dash_dash_parsing(true)
-        .set_dash_dash_as_single_pack(true);
+    return OptTable(std::span<const Option>(kProxyOptInfos));
+}
+
+ParseOptions make_proxy_parse_options() {
+    ParseOptions opts;
+    opts.dash_dash_parsing = true;
+    opts.dash_dash_as_single_pack = true;
+    opts.greedy_unknown = true;
+    return opts;
 }
 
 TEST_SUITE(option_parse_view) {
 
 TEST_CASE(main_option_table_basic) {
     auto table = make_main_opt_table();
+    auto opts = make_main_parse_options();
     auto parsed = parse_all(
         table,
-        split2vec("-p 1234 -s script::profile --dest=114514 -- /usr/bin/clang++ --version"));
+        split2vec("-p 1234 -s script::profile --dest=114514 -- /usr/bin/clang++ --version"),
+        opts);
 
     EXPECT_TRUE(parsed.errors.empty());
     ASSERT_EQ(parsed.args.size(), 5U);
@@ -156,7 +120,8 @@ TEST_CASE(main_option_table_basic) {
 
 TEST_CASE(alias_resolves_to_canonical) {
     auto table = make_main_opt_table();
-    auto parsed = parse_all(table, split2vec("-h"));
+    auto opts = make_main_parse_options();
+    auto parsed = parse_all(table, split2vec("-h"), opts);
     EXPECT_TRUE(parsed.errors.empty());
     ASSERT_EQ(parsed.args.size(), 1U);
     EXPECT_EQ(parsed.args[0].id, MAIN_OPT_HELP);
@@ -166,8 +131,9 @@ TEST_CASE(alias_resolves_to_canonical) {
 
 TEST_CASE(proxy_option_table_basic) {
     auto table = make_proxy_opt_table();
+    auto opts = make_proxy_parse_options();
 
-    auto parsed = parse_all(table, split2vec("-p 1234"));
+    auto parsed = parse_all(table, split2vec("-p 1234"), opts);
     EXPECT_TRUE(parsed.errors.empty());
     ASSERT_EQ(parsed.args.size(), 1U);
     EXPECT_EQ(parsed.args[0].id, PROXY_OPT_PARENT_ID);
@@ -176,7 +142,7 @@ TEST_CASE(proxy_option_table_basic) {
     EXPECT_EQ(parsed.args[0].spelling, "-p");
     EXPECT_EQ(parsed.args[0].index, 0U);
 
-    parsed = parse_all(table, split2vec("--exec /bin/ls"));
+    parsed = parse_all(table, split2vec("--exec /bin/ls"), opts);
     EXPECT_TRUE(parsed.errors.empty());
     ASSERT_EQ(parsed.args.size(), 1U);
     EXPECT_EQ(parsed.args[0].id, PROXY_OPT_EXEC);
@@ -185,7 +151,8 @@ TEST_CASE(proxy_option_table_basic) {
     EXPECT_EQ(parsed.args[0].spelling, "--exec");
     EXPECT_EQ(parsed.args[0].index, 0U);
 
-    parsed = parse_all(table, split2vec("-p 12 --exec /usr/bin/clang++ -- clang++ --version"));
+    parsed =
+        parse_all(table, split2vec("-p 12 --exec /usr/bin/clang++ -- clang++ --version"), opts);
     EXPECT_TRUE(parsed.errors.empty());
     ASSERT_EQ(parsed.args.size(), 3U);
 
@@ -209,10 +176,63 @@ TEST_CASE(proxy_option_table_basic) {
 
 TEST_CASE(proxy_missing_value_error) {
     auto table = make_proxy_opt_table();
-    auto parsed = parse_all(table, split2vec("-p"));
+    auto opts = make_proxy_parse_options();
+    auto parsed = parse_all(table, split2vec("-p"), opts);
     EXPECT_EQ(parsed.args.size(), 0U);
     ASSERT_EQ(parsed.errors.size(), 1U);
     EXPECT_TRUE(std::string_view(parsed.errors[0].message).contains("missing"));
+}
+
+TEST_CASE(unknown_consumes_until_known) {
+    auto table = make_proxy_opt_table();
+    auto opts = make_proxy_parse_options();
+    auto parsed = parse_all(table, split2vec("--unknown-cmd xxx yyy -p 1234"), opts);
+
+    EXPECT_TRUE(parsed.errors.empty());
+    ASSERT_EQ(parsed.args.size(), 2U);
+
+    EXPECT_EQ(parsed.args[0].id, PROXY_OPT_UNKNOWN);
+    EXPECT_EQ(parsed.args[0].spelling, "--unknown-cmd");
+    ASSERT_EQ(parsed.args[0].values.size(), 2U);
+    EXPECT_EQ(parsed.args[0].values[0], "xxx");
+    EXPECT_EQ(parsed.args[0].values[1], "yyy");
+
+    EXPECT_EQ(parsed.args[1].id, PROXY_OPT_PARENT_ID);
+    ASSERT_EQ(parsed.args[1].values.size(), 1U);
+    EXPECT_EQ(parsed.args[1].values[0], "1234");
+}
+
+TEST_CASE(unknown_consumes_all_when_no_known_follows) {
+    auto table = make_proxy_opt_table();
+    auto opts = make_proxy_parse_options();
+    auto parsed = parse_all(table, split2vec("--unknown xxx yyy"), opts);
+
+    EXPECT_TRUE(parsed.errors.empty());
+    ASSERT_EQ(parsed.args.size(), 1U);
+
+    EXPECT_EQ(parsed.args[0].id, PROXY_OPT_UNKNOWN);
+    EXPECT_EQ(parsed.args[0].spelling, "--unknown");
+    ASSERT_EQ(parsed.args[0].values.size(), 2U);
+    EXPECT_EQ(parsed.args[0].values[0], "xxx");
+    EXPECT_EQ(parsed.args[0].values[1], "yyy");
+}
+
+TEST_CASE(consecutive_unknown_prefixed) {
+    auto table = make_proxy_opt_table();
+    auto opts = make_proxy_parse_options();
+    auto parsed = parse_all(table, split2vec("--unknown1 --unknown2 -p 1234"), opts);
+
+    EXPECT_TRUE(parsed.errors.empty());
+    ASSERT_EQ(parsed.args.size(), 2U);
+
+    EXPECT_EQ(parsed.args[0].id, PROXY_OPT_UNKNOWN);
+    EXPECT_EQ(parsed.args[0].spelling, "--unknown1");
+    ASSERT_EQ(parsed.args[0].values.size(), 1U);
+    EXPECT_EQ(parsed.args[0].values[0], "--unknown2");
+
+    EXPECT_EQ(parsed.args[1].id, PROXY_OPT_PARENT_ID);
+    ASSERT_EQ(parsed.args[1].values.size(), 1U);
+    EXPECT_EQ(parsed.args[1].values[0], "1234");
 }
 
 };  // TEST_SUITE(option_parse_view)
@@ -226,16 +246,20 @@ enum GroupedOptionID {
 };
 
 constexpr auto kGroupedOptInfos = std::array{
-    OptTableInfo::input(GROUPED_OPT_INPUT),
-    OptTableInfo::unknown(GROUPED_OPT_UNKNOWN),
-    OptTableInfo::unaliased_one(pfx_dash, "-a", GROUPED_OPT_A, Kind::Flag, 0, "", ""),
-    OptTableInfo::unaliased_one(pfx_dash, "-b", GROUPED_OPT_B, Kind::Flag, 0, "", ""),
+    Option::input(GROUPED_OPT_INPUT),
+    Option::unknown(GROUPED_OPT_UNKNOWN),
+    Option::unaliased_one(pfx_dash, "-a", GROUPED_OPT_A, Kind::Flag, 0, "", ""),
+    Option::unaliased_one(pfx_dash, "-b", GROUPED_OPT_B, Kind::Flag, 0, "", ""),
 };
 
 OptTable make_grouped_opt_table() {
-    return OptTable(std::span<const OptTableInfo>(kGroupedOptInfos))
-        .set_tablegen_mode(false)
-        .set_grouped_short_options(true);
+    return OptTable(std::span<const Option>(kGroupedOptInfos));
+}
+
+ParseOptions make_grouped_parse_options() {
+    ParseOptions opts;
+    opts.grouped_short_options = true;
+    return opts;
 }
 
 enum IgnoreCaseOptionID {
@@ -246,16 +270,13 @@ enum IgnoreCaseOptionID {
 };
 
 constexpr auto kIgnoreCaseOptInfos = std::array{
-    OptTableInfo::input(IGNORE_CASE_OPT_INPUT),
-    OptTableInfo::unknown(IGNORE_CASE_OPT_UNKNOWN),
-    OptTableInfo::unaliased_one(pfx_double, "--help", IGNORE_CASE_OPT_HELP, Kind::Flag, 0, "", ""),
+    Option::input(IGNORE_CASE_OPT_INPUT),
+    Option::unknown(IGNORE_CASE_OPT_UNKNOWN),
+    Option::unaliased_one(pfx_double, "--help", IGNORE_CASE_OPT_HELP, Kind::Flag, 0, "", ""),
 };
 
 OptTable make_ignore_case_opt_table(bool ignore_case) {
-    auto table = OptTable(std::span<const OptTableInfo>(kIgnoreCaseOptInfos));
-    table.set_tablegen_mode(false);
-    table.set_ignore_case(ignore_case);
-    return table;
+    return OptTable(std::span<const Option>(kIgnoreCaseOptInfos), ignore_case);
 }
 
 enum FilterOptionID {
@@ -271,33 +292,33 @@ constexpr std::uint32_t kInternalVisibility = 1U << 1;
 constexpr std::uint32_t kExperimentalFlag = 1U << 6;
 
 constexpr auto kFilterOptInfos = std::array{
-    OptTableInfo::input(FILTER_OPT_INPUT),
-    OptTableInfo::unknown(FILTER_OPT_UNKNOWN),
-    OptTableInfo::unaliased_one(pfx_double, "--public", FILTER_OPT_PUBLIC, Kind::Flag, 0, "", ""),
-    OptTableInfo::unaliased_one(pfx_double,
-                                "--hidden",
-                                FILTER_OPT_HIDDEN,
-                                Kind::Flag,
-                                0,
-                                "",
-                                "",
-                                0,
-                                0,
-                                kInternalVisibility),
-    OptTableInfo::unaliased_one(pfx_double,
-                                "--flagged",
-                                FILTER_OPT_FLAGGED,
-                                Kind::Flag,
-                                0,
-                                "",
-                                "",
-                                0,
-                                kExperimentalFlag,
-                                DefaultVis),
+    Option::input(FILTER_OPT_INPUT),
+    Option::unknown(FILTER_OPT_UNKNOWN),
+    Option::unaliased_one(pfx_double, "--public", FILTER_OPT_PUBLIC, Kind::Flag, 0, "", ""),
+    Option::unaliased_one(pfx_double,
+                          "--hidden",
+                          FILTER_OPT_HIDDEN,
+                          Kind::Flag,
+                          0,
+                          "",
+                          "",
+                          0,
+                          0,
+                          kInternalVisibility),
+    Option::unaliased_one(pfx_double,
+                          "--flagged",
+                          FILTER_OPT_FLAGGED,
+                          Kind::Flag,
+                          0,
+                          "",
+                          "",
+                          0,
+                          kExperimentalFlag,
+                          DefaultVis),
 };
 
 OptTable make_filter_opt_table() {
-    return OptTable(std::span<const OptTableInfo>(kFilterOptInfos)).set_tablegen_mode(false);
+    return OptTable(std::span<const Option>(kFilterOptInfos));
 }
 
 enum KindsOptionID {
@@ -314,55 +335,49 @@ enum KindsOptionID {
 };
 
 constexpr auto kKindsOptInfos = std::array{
-    OptTableInfo::input(KINDS_OPT_INPUT),
-    OptTableInfo::unknown(KINDS_OPT_UNKNOWN),
-    OptTableInfo::unaliased_one(pfx_dash, "-j", KINDS_OPT_JOINED, Kind::Joined, 1, "", ""),
-    OptTableInfo::unaliased_one(pfx_double,
-                                "--list",
-                                KINDS_OPT_COMMA_JOINED,
-                                Kind::CommaJoined,
-                                1,
-                                "",
-                                ""),
-    OptTableInfo::unaliased_one(pfx_double,
-                                "--pair",
-                                KINDS_OPT_MULTI_ARG,
-                                Kind::MultiArg,
-                                2,
-                                "",
-                                ""),
-    OptTableInfo::unaliased_one(pfx_dash,
-                                "-o",
-                                KINDS_OPT_JOINED_OR_SEPARATE,
-                                Kind::JoinedOrSeparate,
-                                1,
-                                "",
-                                ""),
-    OptTableInfo::unaliased_one(pfx_dash,
-                                "-x",
-                                KINDS_OPT_JOINED_AND_SEPARATE,
-                                Kind::JoinedAndSeparate,
-                                2,
-                                "",
-                                ""),
-    OptTableInfo::unaliased_one(pfx_double,
-                                "--rest",
-                                KINDS_OPT_REMAINING,
-                                Kind::RemainingArgs,
-                                0,
-                                "",
-                                ""),
-    OptTableInfo::unaliased_one(pfx_double,
-                                "--tail",
-                                KINDS_OPT_REMAINING_JOINED,
-                                Kind::RemainingArgsJoined,
-                                0,
-                                "",
-                                ""),
+    Option::input(KINDS_OPT_INPUT),
+    Option::unknown(KINDS_OPT_UNKNOWN),
+    Option::unaliased_one(pfx_dash, "-j", KINDS_OPT_JOINED, Kind::Joined, 1, "", ""),
+    Option::unaliased_one(pfx_double,
+                          "--list",
+                          KINDS_OPT_COMMA_JOINED,
+                          Kind::CommaJoined,
+                          1,
+                          "",
+                          ""),
+    Option::unaliased_one(pfx_double, "--pair", KINDS_OPT_MULTI_ARG, Kind::MultiArg, 2, "", ""),
+    Option::unaliased_one(pfx_dash,
+                          "-o",
+                          KINDS_OPT_JOINED_OR_SEPARATE,
+                          Kind::JoinedOrSeparate,
+                          1,
+                          "",
+                          ""),
+    Option::unaliased_one(pfx_dash,
+                          "-x",
+                          KINDS_OPT_JOINED_AND_SEPARATE,
+                          Kind::JoinedAndSeparate,
+                          2,
+                          "",
+                          ""),
+    Option::unaliased_one(pfx_double,
+                          "--rest",
+                          KINDS_OPT_REMAINING,
+                          Kind::RemainingArgs,
+                          0,
+                          "",
+                          ""),
+    Option::unaliased_one(pfx_double,
+                          "--tail",
+                          KINDS_OPT_REMAINING_JOINED,
+                          Kind::RemainingArgsJoined,
+                          0,
+                          "",
+                          ""),
 };
 
 OptTable make_kinds_opt_table() {
-    return OptTable(std::span<const OptTableInfo>(kKindsOptInfos)).set_tablegen_mode(false);
+    return OptTable(std::span<const Option>(kKindsOptInfos));
 }
 
 enum MatchOptionID {
@@ -377,33 +392,26 @@ enum MatchOptionID {
 };
 
 constexpr auto kMatchOptInfos = std::array{
-    OptTableInfo::input(MATCH_OPT_INPUT),
-    OptTableInfo::unknown(MATCH_OPT_UNKNOWN),
-    OptTableInfo::unaliased_one(pfx_none, "group", MATCH_OPT_GROUP, Kind::Group, 0, "", ""),
-    OptTableInfo::unaliased_one(pfx_dash,
-                                "-m",
-                                MATCH_OPT_MEMBER,
-                                Kind::Flag,
-                                0,
-                                "",
-                                "",
-                                MATCH_OPT_GROUP),
-    OptTableInfo::unaliased_one(pfx_dash, "-am", MATCH_OPT_ALIAS_MEMBER, Kind::Flag, 0, "", "")
+    Option::input(MATCH_OPT_INPUT),
+    Option::unknown(MATCH_OPT_UNKNOWN),
+    Option::unaliased_one(pfx_none, "group", MATCH_OPT_GROUP, Kind::Group, 0, "", ""),
+    Option::unaliased_one(pfx_dash, "-m", MATCH_OPT_MEMBER, Kind::Flag, 0, "", "", MATCH_OPT_GROUP),
+    Option::unaliased_one(pfx_dash, "-am", MATCH_OPT_ALIAS_MEMBER, Kind::Flag, 0, "", "")
         .alias_of(MATCH_OPT_MEMBER),
-    OptTableInfo::unaliased_one(pfx_dash, "-j", MATCH_OPT_JOINED, Kind::Joined, 1, "", ""),
-    OptTableInfo::unaliased_one(pfx_dash,
-                                "-r",
-                                MATCH_OPT_OVERRIDE_FLAG,
-                                Kind::Flag,
-                                0,
-                                "",
-                                "",
-                                0,
-                                RenderJoined),
+    Option::unaliased_one(pfx_dash, "-j", MATCH_OPT_JOINED, Kind::Joined, 1, "", ""),
+    Option::unaliased_one(pfx_dash,
+                          "-r",
+                          MATCH_OPT_OVERRIDE_FLAG,
+                          Kind::Flag,
+                          0,
+                          "",
+                          "",
+                          0,
+                          RenderJoined),
 };
 
 OptTable make_match_opt_table() {
-    return OptTable(std::span<const OptTableInfo>(kMatchOptInfos)).set_tablegen_mode(false);
+    return OptTable(std::span<const Option>(kMatchOptInfos));
 }
 
 enum AliasOptionID {
@@ -417,36 +425,24 @@ enum AliasOptionID {
 };
 
 constexpr auto kAliasOptInfos = std::array{
-    OptTableInfo::input(ALIAS_OPT_INPUT),
-    OptTableInfo::unknown(ALIAS_OPT_UNKNOWN),
-    OptTableInfo::unaliased_one(pfx_double,
-                                "--trap=",
-                                ALIAS_OPT_TRAP_EQ,
-                                Kind::CommaJoined,
-                                1,
-                                "",
-                                ""),
-    OptTableInfo::unaliased_one(pfx_double,
-                                "--trap-defaults",
-                                ALIAS_OPT_TRAP_DEFAULTS,
-                                Kind::Flag,
-                                0,
-                                "",
-                                "")
+    Option::input(ALIAS_OPT_INPUT),
+    Option::unknown(ALIAS_OPT_UNKNOWN),
+    Option::unaliased_one(pfx_double, "--trap=", ALIAS_OPT_TRAP_EQ, Kind::CommaJoined, 1, "", ""),
+    Option::unaliased_one(pfx_double,
+                          "--trap-defaults",
+                          ALIAS_OPT_TRAP_DEFAULTS,
+                          Kind::Flag,
+                          0,
+                          "",
+                          "")
         .alias_of(ALIAS_OPT_TRAP_EQ, "all\0undefined\0"),
-    OptTableInfo::unaliased_one(pfx_double, "--emit=", ALIAS_OPT_EMIT_EQ, Kind::Joined, 1, "", ""),
-    OptTableInfo::unaliased_one(pfx_double,
-                                "--emit-llvm",
-                                ALIAS_OPT_EMIT_LLVM,
-                                Kind::Flag,
-                                0,
-                                "",
-                                "")
+    Option::unaliased_one(pfx_double, "--emit=", ALIAS_OPT_EMIT_EQ, Kind::Joined, 1, "", ""),
+    Option::unaliased_one(pfx_double, "--emit-llvm", ALIAS_OPT_EMIT_LLVM, Kind::Flag, 0, "", "")
         .alias_of(ALIAS_OPT_EMIT_EQ),
 };
 
 OptTable make_alias_opt_table() {
-    return OptTable(std::span<const OptTableInfo>(kAliasOptInfos)).set_tablegen_mode(false);
+    return OptTable(std::span<const Option>(kAliasOptInfos));
 }
 
 TEST_SUITE(option_extended_coverage) {
@@ -467,8 +463,9 @@ TEST_CASE(ignore_case_controls_matching) {
 
 TEST_CASE(grouped_short_option_parsing) {
     auto table = make_grouped_opt_table();
+    auto opts = make_grouped_parse_options();
 
-    auto parsed = parse_all(table, split2vec("-ab"));
+    auto parsed = parse_all(table, split2vec("-ab"), opts);
     EXPECT_TRUE(parsed.errors.empty());
     ASSERT_EQ(parsed.args.size(), 2U);
     EXPECT_EQ(parsed.args[0].id, GROUPED_OPT_A);
@@ -477,8 +474,9 @@ TEST_CASE(grouped_short_option_parsing) {
 
 TEST_CASE(grouped_unknown_splits) {
     auto table = make_grouped_opt_table();
+    auto opts = make_grouped_parse_options();
 
-    auto parsed = parse_all(table, split2vec("-zx"));
+    auto parsed = parse_all(table, split2vec("-zx"), opts);
     EXPECT_TRUE(parsed.errors.empty());
     ASSERT_EQ(parsed.args.size(), 2U);
     EXPECT_EQ(parsed.args[0].id, GROUPED_OPT_UNKNOWN);
@@ -487,8 +485,9 @@ TEST_CASE(grouped_unknown_splits) {
 
 TEST_CASE(grouped_equals_form_is_unknown) {
     auto table = make_grouped_opt_table();
+    auto opts = make_grouped_parse_options();
 
-    auto parsed = parse_all(table, split2vec("-a=1"));
+    auto parsed = parse_all(table, split2vec("-a=1"), opts);
     EXPECT_TRUE(parsed.errors.empty());
     ASSERT_EQ(parsed.args.size(), 1U);
     EXPECT_EQ(parsed.args[0].id, GROUPED_OPT_UNKNOWN);
@@ -499,7 +498,9 @@ TEST_CASE(visibility_filter_affects_matching) {
 
     auto argv = split2vec("--hidden");
     ParseCapture default_vis;
-    for(auto& result: table.parse(argv, OptFilter(DefaultVis))) {
+    ParseOptions default_opts;
+    default_opts.visibility = DefaultVis;
+    for(auto& result: parse(table, argv, default_opts)) {
         if(result.has_value())
             default_vis.args.push_back(*result);
         else
@@ -511,7 +512,9 @@ TEST_CASE(visibility_filter_affects_matching) {
 
     argv = split2vec("--hidden");
     ParseCapture capture;
-    for(auto& result: table.parse(argv, OptFilter(kInternalVisibility))) {
+    ParseOptions internal_opts;
+    internal_opts.visibility = kInternalVisibility;
+    for(auto& result: parse(table, argv, internal_opts)) {
         if(result.has_value())
             capture.args.push_back(*result);
         else
@@ -527,7 +530,9 @@ TEST_CASE(flag_filter_affects_matching) {
 
     auto argv = split2vec("--flagged");
     ParseCapture include_capture;
-    for(auto& result: table.parse(argv, {~0U, kExperimentalFlag, 0})) {
+    ParseOptions include_opts;
+    include_opts.include_flags = kExperimentalFlag;
+    for(auto& result: parse(table, argv, include_opts)) {
         if(result.has_value())
             include_capture.args.push_back(*result);
         else
@@ -539,7 +544,9 @@ TEST_CASE(flag_filter_affects_matching) {
 
     argv = split2vec("--flagged");
     ParseCapture exclude_capture;
-    for(auto& result: table.parse(argv, {~0U, 0, kExperimentalFlag})) {
+    ParseOptions exclude_opts;
+    exclude_opts.exclude_flags = kExperimentalFlag;
+    for(auto& result: parse(table, argv, exclude_opts)) {
         if(result.has_value())
             exclude_capture.args.push_back(*result);
         else
@@ -622,13 +629,13 @@ TEST_CASE(option_matches_and_render_style) {
 
     const auto member = table.option(MATCH_OPT_MEMBER);
     const auto alias = table.option(MATCH_OPT_ALIAS_MEMBER);
-    EXPECT_TRUE(member.matches(MATCH_OPT_GROUP));
-    EXPECT_TRUE(alias.matches(MATCH_OPT_GROUP));
-    EXPECT_EQ(alias.unaliased_option().id(), MATCH_OPT_MEMBER);
+    EXPECT_TRUE(member->matches(MATCH_OPT_GROUP));
+    EXPECT_TRUE(alias->matches(MATCH_OPT_GROUP));
+    EXPECT_EQ(alias->unaliased_option().id(), MATCH_OPT_MEMBER);
 
-    EXPECT_EQ(table.option(MATCH_OPT_JOINED).render_style(), RenderStyle::Joined);
-    EXPECT_EQ(table.option(MATCH_OPT_MEMBER).render_style(), RenderStyle::Separate);
-    EXPECT_EQ(table.option(MATCH_OPT_OVERRIDE_FLAG).render_style(), RenderStyle::Joined);
+    EXPECT_EQ(table.option(MATCH_OPT_JOINED)->render_style(), RenderStyle::Joined);
+    EXPECT_EQ(table.option(MATCH_OPT_MEMBER)->render_style(), RenderStyle::Separate);
+    EXPECT_EQ(table.option(MATCH_OPT_OVERRIDE_FLAG)->render_style(), RenderStyle::Joined);
 }
 
 TEST_CASE(flag_aliases_merge_values) {

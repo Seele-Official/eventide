@@ -1,3 +1,5 @@
+#include "kota/deco/option/table.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cctype>
@@ -11,8 +13,6 @@
 #include <utility>
 #include <vector>
 
-#include "kota/deco/option.h"
-
 using namespace kota::option;
 
 namespace {
@@ -24,22 +24,22 @@ enum class AcceptResult {
 };
 
 class ArgSpan {
-    const void* data_;
-    std::uint32_t size_;
-    std::string_view (*access_)(const void*, std::uint32_t);
+    const void* data;
+    std::uint32_t count;
+    std::string_view (*access)(const void*, std::uint32_t);
 
 public:
     ArgSpan(const void* data,
             std::uint32_t size,
             std::string_view (*access)(const void*, std::uint32_t)) :
-        data_(data), size_(size), access_(access) {}
+        data(data), count(size), access(access) {}
 
     std::string_view operator[](std::uint32_t i) const {
-        return access_(data_, i);
+        return access(data, i);
     }
 
     std::uint32_t size() const {
-        return size_;
+        return count;
     }
 };
 
@@ -88,7 +88,7 @@ int str_cmp_opt_name(std::string_view a, std::string_view b, bool fallback_case_
 }
 
 struct OptNameLess {
-    inline bool operator()(const OptTableInfo& i, std::string_view name) const {
+    inline bool operator()(const Option& i, std::string_view name) const {
         return str_cmp_opt_name(i.name(), name, false) < 0;
     }
 };
@@ -96,14 +96,14 @@ struct OptNameLess {
 bool is_input(const OptTable* table, std::string_view arg) {
     if(arg == "-")
         return true;
-    for(const auto& prefix: table->prefixes_union()) {
+    for(const auto& prefix: table->prefixes_union) {
         if(arg.starts_with(prefix))
             return false;
     }
     return true;
 }
 
-std::uint32_t match_opt(const OptTableInfo* i, std::string_view str, bool ignore_case) {
+std::uint32_t match_opt(const Option* i, std::string_view str, bool ignore_case) {
     auto name = i->name();
     for(auto prefix: i->prefixes) {
         if(str.starts_with(prefix)) {
@@ -117,7 +117,40 @@ std::uint32_t match_opt(const OptTableInfo* i, std::string_view str, bool ignore
     return 0;
 }
 
-AcceptResult accept_internal(const Option& opt,
+void consume_unknown_values(const OptTable* table,
+                            const Option* search_begin,
+                            const Option* search_end,
+                            bool ignore_case,
+                            ArgSpan args,
+                            std::uint32_t& index,
+                            ParsedArg& out,
+                            const ParseOptions& options) {
+    while(index < args.size()) {
+        auto next = args[index];
+        if(next.empty() || next == "--")
+            break;
+
+        if(!is_input(table, next)) {
+            bool found_known = false;
+            for(auto* s = search_begin; s != search_end; ++s) {
+                if(match_opt(s, next, ignore_case)) {
+                    OptionRef opt(*s, *table);
+                    if(!options.excludes(opt)) {
+                        found_known = true;
+                        break;
+                    }
+                }
+            }
+            if(found_known)
+                break;
+        }
+
+        out.add_value(next);
+        ++index;
+    }
+}
+
+AcceptResult accept_internal(const OptionRef& opt,
                              ArgSpan args,
                              std::string_view spelling,
                              std::uint32_t& index,
@@ -225,7 +258,7 @@ AcceptResult accept_internal(const Option& opt,
     }
 }
 
-AcceptResult accept_opt(const Option& opt,
+AcceptResult accept_opt(const OptionRef& opt,
                         ArgSpan args,
                         std::string_view spelling,
                         bool grouped_short_option,
@@ -245,7 +278,7 @@ AcceptResult accept_opt(const Option& opt,
     if(result != AcceptResult::Matched)
         return result;
 
-    const Option& unaliased_opt = opt.unaliased_option();
+    OptionRef unaliased_opt = opt.unaliased_option();
     if(opt.id() == unaliased_opt.id()) {
         out.id = opt.id();
         return AcceptResult::Matched;
@@ -270,58 +303,52 @@ AcceptResult accept_opt(const Option& opt,
 
 }  // namespace
 
-OptTable::OptTable(std::span<const OptTable::Info> option_infos,
+OptTable::OptTable(std::span<const Option> option_infos,
                    bool ignore_case,
-                   std::vector<std::string_view> prefixes_union,
-                   bool build_now) :
-    option_infos(option_infos), ignore_case(ignore_case), _prefixes_union(prefixes_union) {
-    if(build_now) {
-        this->build();
-    }
-}
-
-OptTable& OptTable::build() {
+                   std::vector<std::string_view> prefixes_union) :
+    option_infos(option_infos), prefixes_union(std::move(prefixes_union)),
+    ignore_case(ignore_case) {
     bool found_searchable = false;
-    for(std::uint32_t i = 0, e = this->num_options(); i != e; ++i) {
-        Kind kind = this->info(i + 1).kind;
-        if(kind == Kind::Input) {
+    for(std::uint32_t i = 0, e = static_cast<std::uint32_t>(option_infos.size()); i != e; ++i) {
+        auto& info = option_infos[i];
+        if(info.kind == Kind::Input) {
             assert(!this->input_option_id && "Cannot have multiple input options!");
-            this->input_option_id = this->info(i + 1).id;
-        } else if(kind == Kind::Unknown) {
+            this->input_option_id = info.id;
+        } else if(info.kind == Kind::Unknown) {
             assert(!this->unknown_option_id && "Cannot have multiple unknown options!");
-            this->unknown_option_id = this->info(i + 1).id;
-        } else if(kind != Kind::Group && !found_searchable) {
+            this->unknown_option_id = info.id;
+        } else if(info.kind != Kind::Group && !found_searchable) {
             this->first_searchable_index = i;
             found_searchable = true;
         }
     }
-    if(this->input_random_index) {
-        this->first_searchable_index = 0;
-    }
 
-    if(this->_prefixes_union.empty()) {
+    assert(this->unknown_option_id && "OptTable requires an Unknown option.");
+
+    if(this->prefixes_union.empty()) {
         std::set<std::string_view> tmp;
         for(const auto& i: option_infos.subspan(this->first_searchable_index)) {
-            if((i.kind == Kind::Input || i.kind == Kind::Unknown) && input_random_index)
-                continue;
             for(auto prefix: i.prefixes)
                 tmp.insert(prefix);
         }
-        this->_prefixes_union = std::vector<std::string_view>(tmp.begin(), tmp.end());
+        this->prefixes_union = std::vector<std::string_view>(tmp.begin(), tmp.end());
     }
 
-    buildPrefixChars();
-    return *this;
+    std::set<char> seen_chars;
+    for(auto& prefix: this->prefixes_union) {
+        seen_chars.insert(prefix.begin(), prefix.end());
+    }
+    this->prefix_chars.assign(seen_chars.begin(), seen_chars.end());
 }
 
-const Option OptTable::option(std::uint32_t opt_id) const {
+std::optional<OptionRef> OptTable::option(std::uint32_t opt_id) const {
     if(opt_id == 0)
-        return Option(nullptr, nullptr);
-    assert((opt_id - 1) < this->num_options() && "Invalid ID.");
-    return Option(&this->info(opt_id), this);
+        return std::nullopt;
+    assert((opt_id - 1) < static_cast<std::uint32_t>(this->option_infos.size()) && "Invalid ID.");
+    return OptionRef(this->option_infos[opt_id - 1], *this);
 }
 
-std::uint32_t OptTable::find_option(std::string_view argument, OptFilter filter) const {
+std::uint32_t OptTable::find_option(std::string_view argument, std::uint32_t vis) const {
     std::string arg_str(argument);
     if(argument.ends_with("="))
         arg_str += "placeholder";
@@ -333,18 +360,21 @@ std::uint32_t OptTable::find_option(std::string_view argument, OptFilter filter)
     std::uint32_t index = 0;
     ParsedArg out;
 
-    auto result = this->parse_step(args.data(),
-                                   static_cast<std::uint32_t>(args.size()),
-                                   access,
-                                   index,
-                                   out,
-                                   filter);
+    ParseOptions opts;
+    opts.visibility = vis;
+    auto result = parse_step(*this,
+                             args.data(),
+                             static_cast<std::uint32_t>(args.size()),
+                             access,
+                             index,
+                             out,
+                             opts);
     if(result == static_cast<int>(AcceptResult::Matched))
         return out.id;
     return 0;
 }
 
-bool OptFilter::excludes(const Option& opt) const {
+bool ParseOptions::excludes(const OptionRef& opt) const {
     if(!opt.has_visibility_flag(visibility))
         return true;
     if(include_flags && !opt.has_flag(include_flags))
@@ -354,43 +384,45 @@ bool OptFilter::excludes(const Option& opt) const {
     return false;
 }
 
-int OptTable::parse_step(const void* data,
-                         std::uint32_t size,
-                         ArgAccessFn access_fn,
-                         std::uint32_t& index,
-                         ParsedArg& out,
-                         OptFilter filter) const {
+int kota::option::parse_step(const OptTable& table,
+                             const void* data,
+                             std::uint32_t size,
+                             ArgAccessFn access_fn,
+                             std::uint32_t& index,
+                             ParsedArg& out,
+                             const ParseOptions& options) {
     ArgSpan args(data, size, access_fn);
     std::uint32_t prev = index;
     auto str = args[index];
 
-    if(is_input(this, str)) {
+    if(is_input(&table, str)) {
         out.clear();
-        out.id = this->input_option_id;
+        out.id = table.input_option_id;
         out.spelling = str;
         out.index = index++;
         return static_cast<int>(AcceptResult::Matched);
     }
 
-    const Info* start = this->option_infos.data() + this->first_searchable_index;
-    const Info* end = this->option_infos.data() + this->option_infos.size();
-    auto name = ltrim_all_of(str, this->prefix_chars);
+    auto search_start = options.input_random_index ? 0U : table.first_searchable_index;
+    const auto* start = table.option_infos.data() + search_start;
+    const auto* end = table.option_infos.data() + table.option_infos.size();
+    auto name = ltrim_all_of(str, table.prefix_chars);
 
-    start = (this->tablegen_mode) ? std::lower_bound(start, end, name, OptNameLess()) : start;
+    start = (options.tablegen_mode) ? std::lower_bound(start, end, name, OptNameLess()) : start;
 
-    if(this->tablegen_mode) {
+    if(options.tablegen_mode) {
         for(; start != end; ++start) {
             std::uint32_t arg_sz = 0;
             for(; start != end; ++start) {
-                if(arg_sz = match_opt(start, str, this->ignore_case); arg_sz)
+                if(arg_sz = match_opt(start, str, table.ignore_case); arg_sz)
                     break;
             }
             if(start == end)
                 break;
 
-            Option opt(start, this);
+            OptionRef opt(*start, table);
 
-            if(filter.excludes(opt))
+            if(options.excludes(opt))
                 continue;
 
             auto a = accept_opt(opt, args, args[prev].substr(0, arg_sz), false, index, out);
@@ -412,15 +444,15 @@ int OptTable::parse_step(const void* data,
         for(; start != end; ++start) {
             std::uint32_t arg_sz = 0;
             for(; start != end; ++start) {
-                if(arg_sz = match_opt(start, str, this->ignore_case); arg_sz)
+                if(arg_sz = match_opt(start, str, table.ignore_case); arg_sz)
                     break;
             }
             if(start == end)
                 break;
 
-            Option opt(start, this);
+            OptionRef opt(*start, table);
 
-            if(filter.excludes(opt))
+            if(options.excludes(opt))
                 continue;
 
             std::uint32_t candidate_index = prev;
@@ -461,59 +493,72 @@ int OptTable::parse_step(const void* data,
 
     if(str[0] == '/') {
         out.clear();
-        out.id = this->input_option_id;
+        out.id = table.input_option_id;
         out.spelling = str;
         out.index = index++;
         return static_cast<int>(AcceptResult::Matched);
     }
 
     out.clear();
-    out.id = this->unknown_option_id;
+    out.id = table.unknown_option_id;
     out.spelling = str;
     out.index = index++;
+
+    if(options.greedy_unknown && str != "--") {
+        consume_unknown_values(&table,
+                               table.option_infos.data() + search_start,
+                               table.option_infos.data() + table.option_infos.size(),
+                               table.ignore_case,
+                               args,
+                               index,
+                               out,
+                               options);
+    }
+
     return static_cast<int>(AcceptResult::Matched);
 }
 
-int OptTable::parse_step_grouped(const void* data,
-                                 std::uint32_t size,
-                                 ArgAccessFn access_fn,
-                                 std::uint32_t& index,
-                                 ParsedArg& out,
-                                 std::string& group_buf,
-                                 OptFilter filter) const {
+int kota::option::parse_step_grouped(const OptTable& table,
+                                     const void* data,
+                                     std::uint32_t size,
+                                     ArgAccessFn access_fn,
+                                     std::uint32_t& index,
+                                     ParsedArg& out,
+                                     std::string& group_buf,
+                                     const ParseOptions& options) {
     ArgSpan args(data, size, access_fn);
     auto str = args[index];
 
-    if(is_input(this, str)) {
+    if(is_input(&table, str)) {
         out.clear();
-        out.id = this->input_option_id;
+        out.id = table.input_option_id;
         out.spelling = str;
         out.index = index++;
         group_buf.clear();
         return static_cast<int>(AcceptResult::Matched);
     }
 
-    const Info* end_ptr = this->option_infos.data() + this->option_infos.size();
-    auto name = ltrim_all_of(str, this->prefix_chars);
-    const Info* start_ptr =
-        (this->tablegen_mode)
-            ? std::lower_bound(this->option_infos.data() + this->first_searchable_index,
-                               end_ptr,
-                               name,
-                               OptNameLess())
-            : this->option_infos.data() + this->first_searchable_index;
+    auto search_start = options.input_random_index ? 0U : table.first_searchable_index;
+    const auto* end_ptr = table.option_infos.data() + table.option_infos.size();
+    auto name = ltrim_all_of(str, table.prefix_chars);
+    const auto* start_ptr = (options.tablegen_mode)
+                                ? std::lower_bound(table.option_infos.data() + search_start,
+                                                   end_ptr,
+                                                   name,
+                                                   OptNameLess())
+                                : table.option_infos.data() + search_start;
 
-    const Info* fallback_opt = nullptr;
+    const Option* fallback_opt = nullptr;
     std::uint32_t prev = index;
 
     for(auto* it = start_ptr; it != end_ptr; ++it) {
-        std::uint32_t arg_sz = match_opt(it, str, ignore_case);
+        std::uint32_t arg_sz = match_opt(it, str, table.ignore_case);
         if(!arg_sz)
             continue;
 
-        Option opt(it, this);
+        OptionRef opt(*it, table);
 
-        if(filter.excludes(opt))
+        if(options.excludes(opt))
             continue;
 
         auto a = accept_opt(opt, args, str.substr(0, arg_sz), false, index, out);
@@ -532,10 +577,10 @@ int OptTable::parse_step_grouped(const void* data,
     }
 
     if(fallback_opt) {
-        Option opt(fallback_opt, this);
+        OptionRef opt(*fallback_opt, table);
         if(str.size() > 2 && str[2] == '=') {
             out.clear();
-            out.id = this->unknown_option_id;
+            out.id = table.unknown_option_id;
             out.spelling = str;
             out.index = index++;
             group_buf.clear();
@@ -556,7 +601,7 @@ int OptTable::parse_step_grouped(const void* data,
     if(str.size() > 1 && str[1] != '-') {
         auto first_flag_name = str.substr(0, 2);
         out.clear();
-        out.id = this->unknown_option_id;
+        out.id = table.unknown_option_id;
         out.spelling = first_flag_name;
         out.index = index;
         if(str.size() > 2) {
@@ -571,10 +616,22 @@ int OptTable::parse_step_grouped(const void* data,
     }
 
     out.clear();
-    out.id = this->unknown_option_id;
+    out.id = table.unknown_option_id;
     out.spelling = str;
     out.index = index++;
     group_buf.clear();
+
+    if(options.greedy_unknown && str != "--") {
+        consume_unknown_values(&table,
+                               table.option_infos.data() + search_start,
+                               table.option_infos.data() + table.option_infos.size(),
+                               table.ignore_case,
+                               args,
+                               index,
+                               out,
+                               options);
+    }
+
     return static_cast<int>(AcceptResult::Matched);
 }
 
@@ -582,11 +639,9 @@ ParseIter::ParseIter(const OptTable* table,
                      const void* data,
                      std::uint32_t size,
                      ArgAccessFn access,
-                     OptFilter filter) :
-    table(table), data(data), count(size), access(access), filter(filter), done(false),
-    is_dash_dash_parsing(table->dash_dash_parsing),
-    is_dash_dash_as_single_pack(table->dash_dash_as_single_pack),
-    is_grouped(table->grouped_short_options) {
+                     ParseOptions options) :
+    table(table), data(data), count(size), access(access), options(options), done(false),
+    is_grouped(options.grouped_short_options) {
     advance();
 }
 
@@ -603,9 +658,9 @@ void ParseIter::advance() {
             continue;
         }
 
-        if(!past_dash_dash && is_dash_dash_parsing && str == "--") {
+        if(!past_dash_dash && options.dash_dash_parsing && str == "--") {
             past_dash_dash = true;
-            if(is_dash_dash_as_single_pack) {
+            if(options.dash_dash_as_single_pack) {
                 ParsedArg out;
                 out.id = table->input_option_id;
                 out.spelling = "--";
@@ -635,7 +690,7 @@ void ParseIter::advance() {
         if(is_grouped && !in_group) {
             ParsedArg out;
             auto result =
-                table->parse_step_grouped(data, count, access, index, out, group_buf, filter);
+                parse_step_grouped(*table, data, count, access, index, out, group_buf, options);
             if(result == static_cast<int>(AcceptResult::Matched)) {
                 if(!group_buf.empty())
                     in_group = true;
@@ -654,13 +709,14 @@ void ParseIter::advance() {
                 return *static_cast<const std::string*>(d);
             };
             std::uint32_t buf_index = 0;
-            auto result = table->parse_step_grouped(&group_buf,
-                                                    1,
-                                                    buf_access,
-                                                    buf_index,
-                                                    out,
-                                                    group_buf,
-                                                    filter);
+            auto result = parse_step_grouped(*table,
+                                             &group_buf,
+                                             1,
+                                             buf_access,
+                                             buf_index,
+                                             out,
+                                             group_buf,
+                                             options);
             out.index = index;
             if(result == static_cast<int>(AcceptResult::Matched)) {
                 if(group_buf.empty()) {
@@ -676,7 +732,7 @@ void ParseIter::advance() {
             continue;
         } else {
             ParsedArg out;
-            auto result = table->parse_step(data, count, access, index, out, filter);
+            auto result = parse_step(*table, data, count, access, index, out, options);
             if(result == static_cast<int>(AcceptResult::Matched)) {
                 out.next_index = index;
                 current = out;

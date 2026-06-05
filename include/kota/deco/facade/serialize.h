@@ -9,7 +9,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "./backend.h"
+#include "backend.h"
 
 namespace kota::deco::ser {
 

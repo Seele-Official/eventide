@@ -3,6 +3,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "test_util.h"
 #include "kota/deco/deco.h"
 #include "kota/zest/zest.h"
 
@@ -204,58 +205,8 @@ static_assert(std::is_same_v<
               detail::LLVMOptGenerator<ParseAllOpt, detail::BuildStorage<ParseAllOpt>::record>>);
 
 using Parsed = option::ParsedArg;
-
-struct ParsedArgs {
-    std::vector<std::string> argv_storage;
-    std::vector<Parsed> parsed;
-
-    std::size_t size() const {
-        return parsed.size();
-    }
-
-    bool empty() const {
-        return parsed.empty();
-    }
-
-    Parsed& operator[](std::size_t index) {
-        return parsed[index];
-    }
-
-    const Parsed& operator[](std::size_t index) const {
-        return parsed[index];
-    }
-
-    auto begin() {
-        return parsed.begin();
-    }
-
-    auto end() {
-        return parsed.end();
-    }
-
-    auto begin() const {
-        return parsed.begin();
-    }
-
-    auto end() const {
-        return parsed.end();
-    }
-};
-
-template <typename BuiltTy>
-std::expected<ParsedArgs, std::string> parse_with(const BuiltTy& built,
-                                                  std::vector<std::string> argv) {
-    auto table = built.make_opt_table();
-    ParsedArgs args;
-    args.argv_storage = std::move(argv);
-    for(auto& result: table.parse(args.argv_storage)) {
-        if(!result.has_value()) {
-            return std::unexpected(std::string(result.error().message));
-        }
-        args.parsed.push_back(*result);
-    }
-    return args;
-}
+using option::test::ParsedArgs;
+using option::test::parse_with;
 
 TEST_SUITE(deco_backend) {
 

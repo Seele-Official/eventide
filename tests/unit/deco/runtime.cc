@@ -4,8 +4,6 @@
 #pragma warning(disable : 5046)
 #endif
 
-#include "kota/deco/detail/runtime.h"
-
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -16,8 +14,6 @@
 #include <vector>
 
 #include "kota/deco/deco.h"
-#include "kota/deco/detail/macro.h"
-#include "kota/deco/detail/text.h"
 #include "kota/zest/macro.h"
 #include "kota/zest/zest.h"
 
