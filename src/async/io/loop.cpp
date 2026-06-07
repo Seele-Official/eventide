@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cassert>
 #include <deque>
+#include <mutex>
 #include <vector>
 
 #include "../libuv.h"
@@ -11,46 +12,37 @@
 
 namespace kota {
 
-/// A node in the lock-free MPSC (multi-producer, single-consumer) queue
-/// used by event_loop::post(). Each post() allocates a node, atomically
-/// pushes it onto the intrusive stack, and signals uv_async_t. The event
-/// loop thread pops all nodes in one atomic exchange and executes them.
-struct post_node {
-    function<void()> callback;
-    post_node* next = nullptr;
+struct relay::Self {
+    uv_async_t async = {};
+    std::mutex mutex;
+    std::vector<function<void()>> queue;
+    std::atomic<int> count{0};
 };
 
-struct event_loop::self {
+struct event_loop::Self : relay::Self {
     uv_loop_t loop = {};
     uv_idle_t idle = {};
-    uv_async_t async = {};
     bool idle_running = false;
     std::deque<async_node*> tasks;
     std::vector<function<void()>> destroy_callbacks;
-
-    /// Lock-free MPSC stack head. Writers (any thread) push via CAS in
-    /// post(); the single consumer (event loop thread) drains via exchange
-    /// in the uv_async_t callback. No mutex required.
-    std::atomic<post_node*> post_head{nullptr};
-};
-
-struct relay::self {
-    uv_async_t async = {};
-    bool has_callback = false;
-    function<void()> callback{+[] {}};
 };
 
 static void on_relay(uv_async_t* handle) {
-    auto* p = static_cast<struct relay::self*>(handle->data);
-    if(p->has_callback) {
-        p->callback();
+    auto* self = static_cast<event_loop::Self*>(handle->data);
+    std::vector<function<void()>> batch;
+    {
+        std::lock_guard lock(self->mutex);
+        batch = std::move(self->queue);
     }
-    // Close the handle, releasing the loop hold. The close callback
-    // frees the impl once libuv is done with the handle.
-    uv::close(*handle, [](uv_handle_t* h) { delete static_cast<struct relay::self*>(h->data); });
+    for(auto& cb: batch) {
+        cb();
+    }
+    if(self->count.load(std::memory_order_acquire) == 0) {
+        uv::unref(*handle);
+    }
 }
 
-relay::relay(struct relay::self* p) noexcept : self(p) {}
+relay::relay(relay::Self* p) noexcept : self(p) {}
 
 relay::relay(relay&& other) noexcept : self(std::exchange(other.self, nullptr)) {}
 
@@ -58,9 +50,8 @@ relay& relay::operator=(relay&& other) noexcept {
     if(this != &other) {
         auto* old = std::exchange(self, std::exchange(other.self, nullptr));
         if(old) {
-            // Release the old handle by triggering an empty send.
-            relay tmp(old);
-            tmp.send([] {});
+            old->count.fetch_sub(1, std::memory_order_release);
+            uv::async_send(old->async);
         }
     }
     return *this;
@@ -68,29 +59,25 @@ relay& relay::operator=(relay&& other) noexcept {
 
 relay::~relay() {
     if(self) {
-        // The relay was never sent; close the handle to release the loop hold.
-        self->has_callback = false;
+        self->count.fetch_sub(1, std::memory_order_release);
         uv::async_send(self->async);
-        self = nullptr;
     }
 }
 
 void relay::send(function<void()> callback) {
-    auto* p = std::exchange(self, nullptr);
-    if(!p) {
-        return;  // Already sent or moved-from.
+    if(!self) {
+        return;
     }
-    p->has_callback = true;
-    p->callback = std::move(callback);
-    uv::async_send(p->async);
+    std::lock_guard lock(self->mutex);
+    self->queue.push_back(std::move(callback));
+    uv::async_send(self->async);
 }
 
 relay event_loop::create_relay() {
-    auto* p = new struct relay::self();
-    uv::async_init(self->loop, p->async, on_relay);
-    p->async.data = p;
-    // The async handle is ref'd by default, keeping the loop alive.
-    return relay(p);
+    if(self->count.fetch_add(1, std::memory_order_relaxed) == 0) {
+        uv::ref(self->async);
+    }
+    return relay(self.get());
 }
 
 static thread_local event_loop* current_loop = nullptr;
@@ -101,7 +88,7 @@ event_loop& event_loop::current() {
 }
 
 void each(uv_idle_t* idle) {
-    auto self = static_cast<struct event_loop::self*>(idle->data);
+    auto self = static_cast<event_loop::Self*>(idle->data);
     if(self->idle_running && self->tasks.empty()) {
         self->idle_running = false;
         uv::idle_stop(*idle);
@@ -133,61 +120,11 @@ void event_loop::schedule(async_node& frame, std::source_location loc) {
     loop->tasks.push_back(&frame);
 }
 
-void on_post(uv_async_t* handle) {
-    auto* self = static_cast<struct event_loop::self*>(handle->data);
-
-    // Atomically steal the entire pending list. Producers may keep
-    // pushing concurrently — those nodes will be picked up next time.
-    auto* head = self->post_head.exchange(nullptr, std::memory_order_acquire);
-
-    // The stack is in LIFO order; reverse it to preserve FIFO submission order.
-    post_node* reversed = nullptr;
-    while(head) {
-        auto* next = head->next;
-        head->next = reversed;
-        reversed = head;
-        head = next;
-    }
-
-    // Execute all callbacks on the event loop thread, then free nodes.
-    while(reversed) {
-        auto* node = reversed;
-        reversed = reversed->next;
-        node->callback();
-        delete node;
-    }
-}
-
-void event_loop::post(function<void()> callback) {
-    assert(self && "post: event loop has been destroyed");
-
-    auto* node = new post_node{std::move(callback)};
-
-    // Lock-free push: CAS the new node onto the head of the stack.
-    // acq_rel on success: release makes this node's callback visible to
-    // the consumer; acquire chains the visibility of all nodes pushed by
-    // earlier producers (without acquire here, the consumer could follow
-    // the next-pointer chain but see uninitialised callback data on
-    // weakly-ordered architectures like ARM).
-    // uv_async_send is thread-safe and coalescing — multiple sends
-    // before the loop iterates result in a single callback invocation,
-    // which is fine because on_post drains the entire list each time.
-    auto* head = self->post_head.load(std::memory_order_relaxed);
-    do {
-        node->next = head;
-    } while(!self->post_head.compare_exchange_weak(head,
-                                                   node,
-                                                   std::memory_order_acq_rel,
-                                                   std::memory_order_relaxed));
-
-    uv::async_send(self->async);
-}
-
 void event_loop::on_destroy(function<void()> callback) {
     self->destroy_callbacks.push_back(std::move(callback));
 }
 
-event_loop::event_loop() : self(new struct self()) {
+event_loop::event_loop() : self(new Self()) {
     auto& loop = self->loop;
     if(auto err = uv::loop_init(loop)) {
         abort();
@@ -198,15 +135,14 @@ event_loop::event_loop() : self(new struct self()) {
     idle.data = self.get();
 
     auto& async = self->async;
-    uv::async_init(loop, async, on_post);
+    uv::async_init(loop, async, on_relay);
     async.data = self.get();
-    // Unref so the async handle alone does not keep the loop alive.
     uv::unref(async);
 }
 
 event_loop::~event_loop() {
     constexpr static auto cleanup = +[](uv_handle_t* h, void* arg) {
-        auto* self = static_cast<struct event_loop::self*>(arg);
+        auto* self = static_cast<event_loop::Self*>(arg);
         if(!uv::is_closing(*h)) {
             auto* idle = uv::as_handle(self->idle);
             auto* async = uv::as_handle(self->async);
@@ -219,13 +155,12 @@ event_loop::~event_loop() {
         }
     };
 
-    // Drain any remaining posted callbacks that were never delivered
-    // (e.g. posted after the loop stopped running).
-    auto* leaked = self->post_head.exchange(nullptr, std::memory_order_acquire);
-    while(leaked) {
-        auto* next = leaked->next;
-        delete leaked;
-        leaked = next;
+    assert(self->count.load(std::memory_order_acquire) == 0 &&
+           "event_loop destroyed with live relays");
+
+    {
+        std::lock_guard lock(self->mutex);
+        self->queue.clear();
     }
 
     auto callbacks = std::move(self->destroy_callbacks);

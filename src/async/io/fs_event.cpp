@@ -38,10 +38,14 @@ namespace kota {
 // Thread safety: `closed` is atomic and may be read/written from any thread.
 // All other fields are only accessed from the event-loop thread except during
 // platform callbacks (macOS dispatch queue, Windows worker thread), which
-// only read `root_path`, `recursive`, and `loop` (all immutable after create)
-// and call post_change()/post_changes() to marshal events to the loop thread.
+// read `root_path`, `recursive` (immutable after create) and call
+// post_change()/post_changes() → notifier.send() (thread-safe) to marshal
+// events to the loop thread. stop_platform() must fully synchronize with
+// all platform callbacks before returning, so that stop() can safely
+// destroy the notifier afterwards.
 struct fs_event_base {
     event_loop* loop;
+    relay notifier;
     timer debounce_timer;
     event has_events{false};
     // Accessed only on the event-loop thread; guarded by debounce_timer.
@@ -61,7 +65,7 @@ struct fs_event_base {
     }
 
     void post_change(std::weak_ptr<fs_event_base> weak, fs_event::change c) {
-        loop->post([weak = std::move(weak), c = std::move(c)]() mutable {
+        notifier.send([weak = std::move(weak), c = std::move(c)]() mutable {
             if(auto s = weak.lock()) {
                 s->push_event(std::move(c));
             }
@@ -69,7 +73,7 @@ struct fs_event_base {
     }
 
     void post_changes(std::weak_ptr<fs_event_base> weak, std::vector<fs_event::change> changes) {
-        loop->post([weak = std::move(weak), changes = std::move(changes)]() mutable {
+        notifier.send([weak = std::move(weak), changes = std::move(changes)]() mutable {
             if(auto s = weak.lock()) {
                 for(auto& c: changes) {
                     s->push_event(std::move(c));
@@ -333,6 +337,7 @@ struct fs_event::Self : fs_event_base, std::enable_shared_from_this<Self> {
             return error(rc);
         }
 
+        // The notifier relay keeps the loop alive, not this poll handle.
         uv_unref(reinterpret_cast<uv_handle_t*>(&poll_handle));
         return error{};
     }
@@ -371,6 +376,10 @@ struct fs_event::Self : fs_event_base, std::enable_shared_from_this<Self> {
         }
 
         if(dispatch_queue) {
+            // After invalidation, an already-dispatched callback may still be
+            // running on the queue. Synchronously drain it so that stop() can
+            // safely destroy the notifier without racing with send().
+            dispatch_sync_f(dispatch_queue, nullptr, +[](void*) {});
             dispatch_release(dispatch_queue);
             dispatch_queue = nullptr;
         }
@@ -860,6 +869,7 @@ result<fs_event> fs_event::create(std::string_view path, options opts, event_loo
     std::replace(s->root_path.begin(), s->root_path.end(), '\\', '/');
 #endif
 
+    s->notifier = loop.create_relay();
     s->debounce_timer = timer::create(loop);
 
     auto init_err = s->init_platform(s);
@@ -949,6 +959,7 @@ void fs_event::stop() {
     self->debounce_timer.start(std::chrono::milliseconds{0});
 
     self->stop_platform();
+    self->notifier = relay{};
 }
 
 }  // namespace kota

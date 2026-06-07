@@ -1,4 +1,6 @@
+#include <atomic>
 #include <thread>
+#include <vector>
 
 #include "loop_fixture.h"
 #include "kota/zest/zest.h"
@@ -24,16 +26,18 @@ TEST_CASE(relay_keeps_loop_alive) {
 
 TEST_CASE(relay_cross_thread_send) {
     int value = 0;
+    std::thread worker;
 
     auto t = [&]() -> task<> {
         auto r = loop.create_relay();
-        std::thread([&, r = std::move(r)]() mutable { r.send([&] { value = 42; }); }).detach();
+        worker = std::thread([&, r = std::move(r)]() mutable { r.send([&] { value = 42; }); });
         co_await sleep(100, loop);
         loop.stop();
     };
 
     auto task = t();
     schedule_all(task);
+    worker.join();
     EXPECT_EQ(value, 42);
 }
 
@@ -70,28 +74,199 @@ TEST_CASE(relay_move_semantics) {
     EXPECT_TRUE(called);
 }
 
-TEST_CASE(relay_duplicate_send) {
-    // Only the first send() should take effect; subsequent calls are no-ops.
+TEST_CASE(relay_multiple_send) {
     int counter = 0;
 
-    auto r = loop.create_relay();
-    r.send([&] { counter++; });
-    r.send([&] { counter++; });
-    r.send([&] { counter++; });
+    auto t = [&]() -> task<> {
+        auto r = loop.create_relay();
+        r.send([&] { counter++; });
+        r.send([&] { counter++; });
+        r.send([&] { counter++; });
+        co_await sleep(50, loop);
+    };
 
-    loop.run();
-    EXPECT_EQ(counter, 1);
+    auto task = t();
+    schedule_all(task);
+    EXPECT_EQ(counter, 3);
 }
 
 TEST_CASE(relay_send_with_noop) {
-    // Sending a no-op callback should just release the loop hold
-    // without crashing.
+    // Sending a no-op callback and then destroying the relay should
+    // release the loop hold without crashing.
     auto r = loop.create_relay();
 
     std::thread worker([&, r = std::move(r)]() mutable { r.send([] {}); });
 
     loop.run();
     worker.join();
+}
+
+TEST_CASE(relay_concurrent_send) {
+    constexpr int N = 4;
+    constexpr int M = 25;
+    std::atomic<int> counter{0};
+
+    auto t = [&]() -> task<> {
+        auto r = loop.create_relay();
+        std::vector<std::thread> threads;
+        for(int i = 0; i < N; ++i) {
+            threads.emplace_back([&r, &counter]() {
+                for(int j = 0; j < M; ++j) {
+                    r.send([&] { counter.fetch_add(1, std::memory_order_relaxed); });
+                }
+            });
+        }
+        for(auto& th: threads) {
+            th.join();
+        }
+        // All threads joined; callbacks are enqueued. Sleep to let them drain.
+        co_await sleep(200, loop);
+    };
+
+    auto task = t();
+    schedule_all(task);
+    EXPECT_EQ(counter.load(), N * M);
+}
+
+TEST_CASE(relay_stress_cross_thread) {
+    int counter = 0;
+
+    auto r = loop.create_relay();
+    std::thread worker([&, r = std::move(r)]() mutable {
+        for(int i = 0; i < 100; ++i) {
+            r.send([&] { counter++; });
+        }
+    });
+
+    loop.run();
+    worker.join();
+    EXPECT_EQ(counter, 100);
+}
+
+TEST_CASE(relay_send_after_move) {
+    bool called = false;
+
+    auto t = [&]() -> task<> {
+        auto r1 = loop.create_relay();
+        auto r2 = std::move(r1);
+
+        // r1 is moved-from (self == nullptr), send should be a safe no-op.
+        r1.send([&] { called = true; });
+
+        // Ensure the loop can still exit cleanly by destroying r2.
+        co_return;
+    };
+
+    auto task = t();
+    schedule_all(task);
+    EXPECT_TRUE(!called);
+}
+
+TEST_CASE(relay_callback_stops_loop) {
+    bool stopped = false;
+
+    auto r = loop.create_relay();
+    std::thread worker([&, r = std::move(r)]() mutable {
+        r.send([&] {
+            stopped = true;
+            loop.stop();
+        });
+    });
+
+    loop.run();
+    worker.join();
+    EXPECT_TRUE(stopped);
+}
+
+TEST_CASE(relay_fifo_order) {
+    std::vector<int> order;
+
+    auto t = [&]() -> task<> {
+        auto r = loop.create_relay();
+        for(int i = 0; i < 5; ++i) {
+            r.send([&, i] { order.push_back(i); });
+        }
+        co_await sleep(50, loop);
+    };
+
+    auto task = t();
+    schedule_all(task);
+    EXPECT_EQ(order, (std::vector<int>{0, 1, 2, 3, 4}));
+}
+
+TEST_CASE(relay_pending_callbacks_delivered_after_destroy) {
+    int counter = 0;
+
+    auto t = [&]() -> task<> {
+        {
+            auto r = loop.create_relay();
+            r.send([&] { counter++; });
+            r.send([&] { counter++; });
+            // relay destroyed here; pending callbacks should still be delivered
+        }
+        co_await sleep(50, loop);
+    };
+
+    auto task = t();
+    schedule_all(task);
+    EXPECT_EQ(counter, 2);
+}
+
+TEST_CASE(relay_send_during_drain) {
+    int counter = 0;
+    relay* shared = nullptr;
+
+    auto t = [&]() -> task<> {
+        auto r = loop.create_relay();
+        shared = &r;
+        r.send([&] {
+            counter++;
+            shared->send([&] { counter++; });
+        });
+        co_await sleep(50, loop);
+    };
+
+    auto task = t();
+    schedule_all(task);
+    EXPECT_EQ(counter, 2);
+}
+
+TEST_CASE(relay_move_assign_releases_old) {
+    int old_counter = 0;
+    int new_counter = 0;
+
+    auto t = [&]() -> task<> {
+        auto r = loop.create_relay();
+        r.send([&] { old_counter++; });
+
+        // Move-assign overwrites r; old relay's pending callback should still run.
+        r = loop.create_relay();
+        r.send([&] { new_counter++; });
+        co_await sleep(50, loop);
+    };
+
+    auto task = t();
+    schedule_all(task);
+    EXPECT_EQ(old_counter, 1);
+    EXPECT_EQ(new_counter, 1);
+}
+
+TEST_CASE(relay_multiple_keep_alive) {
+    // Two relays: destroying one should not release the loop hold while the
+    // other is still alive.
+    bool called = false;
+
+    auto r1 = loop.create_relay();
+    auto r2 = loop.create_relay();
+
+    // Destroy r1 immediately; r2 alone should still keep the loop alive.
+    r1 = relay{};
+
+    std::thread worker([&, r = std::move(r2)]() mutable { r.send([&] { called = true; }); });
+
+    loop.run();
+    worker.join();
+    EXPECT_TRUE(called);
 }
 
 };  // TEST_SUITE(event_loop_relay)
