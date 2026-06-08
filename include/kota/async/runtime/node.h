@@ -205,6 +205,8 @@ public:
     }
 
 protected:
+    using abandon_fn = void (*)(void*) noexcept;
+
     /// The sync_primitive this waiter is queued on (nullptr if not queued).
     sync_primitive* resource = nullptr;
 
@@ -224,6 +226,10 @@ protected:
     wait_node* next = nullptr;
 
     async_node* parent = nullptr;
+
+    void* abandon_context = nullptr;
+
+    abandon_fn abandon = nullptr;
 };
 
 /// Base for when_all / when_any.

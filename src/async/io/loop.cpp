@@ -22,8 +22,11 @@ struct relay::Self {
 struct event_loop::Self : relay::Self {
     uv_loop_t loop = {};
     uv_idle_t idle = {};
+    uv_check_t check = {};
     bool idle_running = false;
+    bool check_running = false;
     std::deque<async_node*> tasks;
+    std::deque<async_node*> deferred;
     std::vector<function<void()>> destroy_callbacks;
 };
 
@@ -87,6 +90,10 @@ event_loop& event_loop::current() {
     return *current_loop;
 }
 
+bool event_loop::has_current() noexcept {
+    return current_loop != nullptr;
+}
+
 void each(uv_idle_t* idle) {
     auto self = static_cast<event_loop::Self*>(idle->data);
     if(self->idle_running && self->tasks.empty()) {
@@ -120,6 +127,38 @@ void event_loop::schedule(async_node& frame, std::source_location loc) {
     loop->tasks.push_back(&frame);
 }
 
+static void drain_deferred_queue(event_loop::Self* self) {
+    while(!self->deferred.empty()) {
+        auto batch = std::move(self->deferred);
+        for(auto* node: batch) {
+            node->resume();
+        }
+    }
+}
+
+static void on_check(uv_check_t* handle) {
+    auto* self = static_cast<event_loop::Self*>(handle->data);
+    drain_deferred_queue(self);
+    if(self->check_running) {
+        self->check_running = false;
+        uv::check_stop(*handle);
+        uv::unref(*handle);
+    }
+}
+
+void event_loop::defer_resume(async_node& node) {
+    self->deferred.push_back(&node);
+    if(!self->check_running) {
+        self->check_running = true;
+        uv::ref(self->check);
+        uv::check_start(self->check, on_check);
+    }
+}
+
+void event_loop::drain_deferred() {
+    drain_deferred_queue(self.get());
+}
+
 void event_loop::on_destroy(function<void()> callback) {
     self->destroy_callbacks.push_back(std::move(callback));
 }
@@ -134,6 +173,11 @@ event_loop::event_loop() : self(new Self()) {
     uv::idle_init(loop, idle);
     idle.data = self.get();
 
+    auto& check = self->check;
+    uv::check_init(loop, check);
+    check.data = self.get();
+    uv::unref(check);
+
     auto& async = self->async;
     uv::async_init(loop, async, on_relay);
     async.data = self.get();
@@ -145,8 +189,9 @@ event_loop::~event_loop() {
         auto* self = static_cast<event_loop::Self*>(arg);
         if(!uv::is_closing(*h)) {
             auto* idle = uv::as_handle(self->idle);
+            auto* check = uv::as_handle(self->check);
             auto* async = uv::as_handle(self->async);
-            if(h == idle || h == async) {
+            if(h == idle || h == check || h == async) {
                 uv::close(*h, nullptr);
                 return;
             }

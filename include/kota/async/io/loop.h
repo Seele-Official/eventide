@@ -97,6 +97,9 @@ public:
     /// Returns the event loop running on the current thread.
     static event_loop& current();
 
+    /// Returns true if a loop is running on the current thread.
+    static bool has_current() noexcept;
+
     /// Opaque implementation detail. Defined in loop.cpp.
     struct Self;
 
@@ -143,6 +146,18 @@ public:
 
         schedule(static_cast<async_node&>(promise), location);
     }
+
+    /// Queues a node for deferred resumption.
+    ///
+    /// Unlike schedule(), this does not check or modify the node's state.
+    /// Used by sync primitives to defer waiter resumes instead of resuming
+    /// inline (which would cause reentrancy).
+    void defer_resume(async_node& node);
+
+    /// Drains all deferred resumes. The runtime calls this after the outermost
+    /// coroutine resume returns; a check handle is kept as a fallback so queued
+    /// resumes still run before the next loop iteration.
+    void drain_deferred();
 
 private:
     void schedule(async_node& frame, std::source_location location);
