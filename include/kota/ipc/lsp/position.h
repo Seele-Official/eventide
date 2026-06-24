@@ -4,62 +4,71 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 #include "kota/ipc/lsp/protocol.h"
+#include "kota/ipc/lsp/text.h"
 
 namespace kota::ipc::lsp {
 
-/// Position unit encoding used by LSP line/character coordinates.
-enum class PositionEncoding : std::uint8_t {
-    /// Character counts UTF-8 code units (bytes).
-    UTF8,
+/// Source content + line starts for LSP position conversion.
+/// Line starts are held either as a borrowed span or as an owned vector.
+class LineMap {
+public:
+    using Offset = std::uint32_t;
 
-    /// Character counts UTF-16 code units.
-    UTF16,
+    struct LineBounds {
+        /// Zero-based line number.
+        Offset line;
 
-    /// Character counts UTF-32 code units (code points).
-    UTF32,
+        /// Byte offset of the line start.
+        Offset start;
+
+        /// Byte offset of the line end (before the newline).
+        Offset end;
+    };
+
+    /// Compute line starts from content.
+    explicit LineMap(std::string_view content, PositionEncoding encoding = PositionEncoding::UTF16);
+
+    /// Borrow pre-computed line starts. Caller must keep the data alive.
+    LineMap(std::string_view content,
+            std::span<const Offset> line_starts,
+            PositionEncoding encoding = PositionEncoding::UTF16);
+
+    /// Take ownership of pre-computed line starts.
+    LineMap(std::string_view content,
+            std::vector<Offset>&& line_starts,
+            PositionEncoding encoding = PositionEncoding::UTF16);
+
+    /// Convert a byte offset to an LSP Position.
+    std::optional<protocol::Position>
+        to_position(Offset offset, PositionEncoding encoding = PositionEncoding::Default) const;
+
+    /// Convert an LSP Position to a byte offset.
+    std::optional<Offset> to_offset(protocol::Position position,
+                                    PositionEncoding encoding = PositionEncoding::Default) const;
+
+    /// Convert a byte range to an LSP Range.
+    std::optional<protocol::Range>
+        to_range(Offset begin,
+                 Offset end,
+                 PositionEncoding encoding = PositionEncoding::Default) const;
+
+    /// Get line number and byte boundaries for the line containing the offset.
+    LineBounds line_bounds(Offset offset) const;
+
+    std::string_view content() const;
+
+    std::span<const Offset> line_starts() const;
+
+private:
+    PositionEncoding resolve(PositionEncoding encoding) const;
+
+    std::string_view source;
+    std::variant<std::vector<Offset>, std::span<const Offset>> starts;
+    PositionEncoding enc;
 };
-
-/// Parses LSP encoding name (e.g. "utf-16") to `PositionEncoding`.
-/// Unknown values fall back to `PositionEncoding::UTF16`.
-PositionEncoding parse_position_encoding(std::string_view encoding);
-
-/// Scans `content` for newlines and returns byte offsets of each line start.
-std::vector<std::uint32_t> build_line_starts(std::string_view content);
-
-/// Byte range of a single line within the content.
-struct LineBounds {
-    /// Zero-based line number.
-    std::uint32_t line;
-    /// Byte offset of the first character on this line.
-    std::uint32_t start;
-    /// Byte offset one past the last content character (excluding '\n').
-    std::uint32_t end;
-};
-
-/// Returns the line number and byte range `[start, end)` for the line containing `offset`.
-/// `end` points one past the last content byte (excluding the '\n').
-LineBounds line_bounds(std::span<const std::uint32_t> line_starts,
-                       std::uint32_t bound,
-                       std::uint32_t offset);
-
-/// Returns `text` length in the given position encoding.
-std::uint32_t encoded_length(std::string_view text, PositionEncoding encoding);
-
-/// Converts a byte offset to LSP `Position{line, character}`.
-/// Returns `std::nullopt` when the offset is out of range.
-std::optional<protocol::Position> to_position(std::string_view content,
-                                              std::span<const std::uint32_t> line_starts,
-                                              PositionEncoding encoding,
-                                              std::uint32_t offset);
-
-/// Converts LSP position to byte offset in the original text.
-/// Returns `std::nullopt` when the position is out of range.
-std::optional<std::uint32_t> to_offset(std::string_view content,
-                                       std::span<const std::uint32_t> line_starts,
-                                       PositionEncoding encoding,
-                                       protocol::Position position);
 
 }  // namespace kota::ipc::lsp
