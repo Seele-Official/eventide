@@ -48,6 +48,26 @@ extra = true
     ASSERT_FALSE(result.has_value());
     auto& e = result.error();
     EXPECT_EQ(e.message, "unknown field 'extra'");
+    // The TOML backend attaches the offending value node's location.
+    ASSERT_TRUE(e.location.has_value());
+    EXPECT_EQ(e.location->line, 4);
+    EXPECT_EQ(e.location->column, 9);
+}
+
+TEST_CASE(syntax_error_has_location) {
+    // Unterminated string — a tokenizer-level error, reported by parse_table
+    // through toml++'s parse_result (toml++ is pinned to TOML_EXCEPTIONS=0,
+    // see kota/codec/toml/type.h).
+    auto result = parse<person>(R"(
+name = "alice
+age = 30
+)");
+    ASSERT_FALSE(result.has_value());
+    auto& e = result.error();
+    EXPECT_TRUE(e.message.starts_with("TOML parse error: "));
+    EXPECT_TRUE(e.message.size() > std::string_view("TOML parse error: ").size());
+    ASSERT_TRUE(e.location.has_value());
+    EXPECT_EQ(e.location->line, 2);
 }
 
 TEST_CASE(nested_field_error_path) {
