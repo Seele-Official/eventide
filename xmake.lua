@@ -232,6 +232,7 @@ if has_config("deco") then
 		add_headerfiles(
 			"include/(kota/deco/option.h)",
 			"include/(kota/deco/deco.h)",
+			"include/(kota/deco/macro.h)",
 			"include/(kota/deco/option/**.h)",
 			"include/(kota/deco/facade/**.h)"
 		)
@@ -361,6 +362,9 @@ if has_config("test") and has_config("ztest") then
 		end
 		if has_config("codec") and has_config("codec_simdjson") then
 			add_files("tests/unit/codec/json/**.cpp")
+			-- Lets always-built suites opt into cases that need the JSON codec,
+			-- such as zest's EXPECT_SNAPSHOT_JSON tests.
+			add_defines("KOTA_TEST_HAS_JSON=1")
 		end
 		if has_config("codec") then
 			add_files("tests/unit/codec/dyn/**.cpp")

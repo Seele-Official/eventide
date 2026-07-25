@@ -1,9 +1,12 @@
 #pragma once
 
-#include "kota/zest/assert/check.h"
-#include "kota/zest/assert/trace.h"
-#include "kota/zest/runner/suite.h"
-#include "kota/zest/snapshot/snapshot.h"
+// The zest test macros, and nothing else — this header includes nothing, by
+// design. Modules cannot export macros, so a downstream consuming kotatsu as a
+// module still has to pick these up textually, and anything included here would
+// duplicate declarations the module already provides.
+//
+// The kota::zest entities an expansion refers to only have to be visible where
+// the macro is used, not here. Include "kota/zest/zest.h" or import the module.
 
 #define TEST_SUITE(name, ...)                                                                      \
     struct name##TEST : __VA_OPT__(__VA_ARGS__, )::kota::zest::TestSuiteDef<name##TEST>
@@ -171,8 +174,13 @@
 
 #endif
 
-#if __has_include("kota/codec/json/json.h")
-#include "kota/codec/json/json.h"
+// Defined unconditionally, like every other macro here: these name
+// ::kota::codec::json, which — as always — only has to be visible where the
+// macro is used. Reaching for the JSON snapshot macros without the JSON codec
+// available is a name-lookup error at that use site, which is the honest
+// failure. (This used to be gated on __has_include of kotatsu's own json.h,
+// which answered the wrong question: that file is on disk whether or not the
+// codec was built, so the gate opened even when the backend was unavailable.)
 
 // clang-format off
 #define ZEST_SNAPSHOT_JSON_IMPL(return_action, value, ...)                                         \
@@ -201,5 +209,3 @@
 #define ASSERT_SNAPSHOT_JSON(value, ...) ZEST_SNAPSHOT_JSON_IMPL(return, value __VA_OPT__(,) __VA_ARGS__)
 #define CO_ASSERT_SNAPSHOT_JSON(value, ...) ZEST_SNAPSHOT_JSON_IMPL(co_return, value __VA_OPT__(,) __VA_ARGS__)
 // clang-format on
-
-#endif
