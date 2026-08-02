@@ -355,8 +355,13 @@ ScanResult scan_and_accept(const OptTable& table,
         }
 
         if(arg_sz == 2 && it->kind == Kind::Flag) {
-            result.fallback_flag = it;
-            result.fallback_excluded = excluded;
+            // A visible fallback must not be shadowed by a later excluded
+            // duplicate with the same spelling: grouped expansion would then
+            // drop the visible option instead of yielding it.
+            if(result.fallback_flag == nullptr || !excluded || result.fallback_excluded) {
+                result.fallback_flag = it;
+                result.fallback_excluded = excluded;
+            }
         }
 
         if(try_index != index) {
@@ -427,8 +432,13 @@ bool is_known_option(SearchRange range,
         }
 
         OptionRef opt(*s, table);
-        if(options.excludes(opt))
-            return options.skip_excluded;
+        if(options.excludes(opt)) {
+            if(options.skip_excluded)
+                return true;
+            // Default (skip_excluded off): keep scanning so a later visible
+            // duplicate is still recognized as a greedy-unknown boundary.
+            continue;
+        }
         return true;
     }
     return false;

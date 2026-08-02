@@ -433,6 +433,64 @@ ParseOptions make_skip_parse_options() {
     return opts;
 }
 
+enum GroupedDupOptionID {
+    GRPDUP_OPT_INVALID = 0,
+    GRPDUP_OPT_INPUT = 1,
+    GRPDUP_OPT_UNKNOWN = 2,
+    GRPDUP_OPT_A_VISIBLE,  // -a Flag DefaultVis (first)
+    GRPDUP_OPT_A_HIDDEN,   // -a Flag kInternalVisibility (second)
+    GRPDUP_OPT_B,          // -b Flag DefaultVis
+};
+
+constexpr auto kGroupedDupOptInfos = std::array{
+    Option::input(GRPDUP_OPT_INPUT),
+    Option::unknown(GRPDUP_OPT_UNKNOWN),
+    Option::unaliased_one(pfx_dash, "-a", GRPDUP_OPT_A_VISIBLE, Kind::Flag, 0, "", ""),
+    Option::unaliased_one(pfx_dash,
+                          "-a",
+                          GRPDUP_OPT_A_HIDDEN,
+                          Kind::Flag,
+                          0,
+                          "",
+                          "",
+                          0,
+                          0,
+                          kInternalVisibility),
+    Option::unaliased_one(pfx_dash, "-b", GRPDUP_OPT_B, Kind::Flag, 0, "", ""),
+};
+
+OptTable make_grouped_dup_opt_table() {
+    return OptTable(std::span<const Option>(kGroupedDupOptInfos));
+}
+
+enum GreedyDupOptionID {
+    GREEDY_DUP_OPT_INVALID = 0,
+    GREEDY_DUP_OPT_INPUT = 1,
+    GREEDY_DUP_OPT_UNKNOWN = 2,
+    GREEDY_DUP_OPT_X_HIDDEN,  // -x Flag kInternalVisibility (first)
+    GREEDY_DUP_OPT_X_VISIBLE  // -x Flag DefaultVis (second)
+};
+
+constexpr auto kGreedyDupOptInfos = std::array{
+    Option::input(GREEDY_DUP_OPT_INPUT),
+    Option::unknown(GREEDY_DUP_OPT_UNKNOWN),
+    Option::unaliased_one(pfx_dash,
+                          "-x",
+                          GREEDY_DUP_OPT_X_HIDDEN,
+                          Kind::Flag,
+                          0,
+                          "",
+                          "",
+                          0,
+                          0,
+                          kInternalVisibility),
+    Option::unaliased_one(pfx_dash, "-x", GREEDY_DUP_OPT_X_VISIBLE, Kind::Flag, 0, "", ""),
+};
+
+OptTable make_greedy_dup_opt_table() {
+    return OptTable(std::span<const Option>(kGreedyDupOptInfos));
+}
+
 enum KindsOptionID {
     KINDS_OPT_INVALID = 0,
     KINDS_OPT_INPUT = 1,
@@ -780,6 +838,61 @@ TEST_CASE(skip_excluded_all_duplicates_hidden) {
     auto parsed = parse_all(table, split2vec("-d"), opts);
     EXPECT_TRUE(parsed.errors.empty());
     EXPECT_TRUE(parsed.args.empty());
+}
+
+TEST_CASE(skip_excluded_grouped_visible_duplicate_wins) {
+    auto table = make_grouped_dup_opt_table();
+    auto opts = make_skip_parse_options();
+    opts.grouped_short_options = true;
+
+    // "-ab" expands to visible "-a" + "-b"; the hidden duplicate of "-a" that
+    // follows it in the table must not steal the grouped fallback.
+    auto parsed = parse_all(table, split2vec("-ab"), opts);
+    EXPECT_TRUE(parsed.errors.empty());
+    ASSERT_EQ(parsed.args.size(), 2U);
+    EXPECT_EQ(parsed.args[0].id, GRPDUP_OPT_A_VISIBLE);
+    EXPECT_EQ(parsed.args[0].spelling, "-a");
+    EXPECT_EQ(parsed.args[1].id, GRPDUP_OPT_B);
+    EXPECT_EQ(parsed.args[1].spelling, "-b");
+}
+
+TEST_CASE(greedy_unknown_default_keeps_visible_duplicate_boundary) {
+    auto table = make_greedy_dup_opt_table();
+    ParseOptions opts;
+    opts.greedy_unknown = true;
+    opts.visibility = DefaultVis;
+    // skip_excluded stays false (default).
+
+    // The hidden "-x" precedes the visible "-x"; greedy unknown must still
+    // stop before it and yield the visible option instead of swallowing it.
+    auto parsed = parse_all(table, split2vec("--unknown -x"), opts);
+    EXPECT_TRUE(parsed.errors.empty());
+    ASSERT_EQ(parsed.args.size(), 2U);
+    EXPECT_EQ(parsed.args[0].id, GREEDY_DUP_OPT_UNKNOWN);
+    EXPECT_EQ(parsed.args[0].spelling, "--unknown");
+    EXPECT_TRUE(parsed.args[0].values.empty());
+    EXPECT_EQ(parsed.args[1].id, GREEDY_DUP_OPT_X_VISIBLE);
+    EXPECT_EQ(parsed.args[1].spelling, "-x");
+}
+
+TEST_CASE(greedy_unknown_skip_excluded_stops_at_hidden_option) {
+    auto table = make_greedy_dup_opt_table();
+    ParseOptions opts;
+    opts.greedy_unknown = true;
+    // Neither duplicate carries this visibility bit, so both are excluded.
+    opts.visibility = kExperimentalFlag;
+    opts.skip_excluded = true;
+
+    // Both "-x" entries are excluded here; greedy unknown stops at "-x", which
+    // is then consumed silently, leaving "tail" as the only input.
+    auto parsed = parse_all(table, split2vec("--unknown -x tail"), opts);
+    EXPECT_TRUE(parsed.errors.empty());
+    ASSERT_EQ(parsed.args.size(), 2U);
+    EXPECT_EQ(parsed.args[0].id, GREEDY_DUP_OPT_UNKNOWN);
+    EXPECT_EQ(parsed.args[0].spelling, "--unknown");
+    EXPECT_TRUE(parsed.args[0].values.empty());
+    EXPECT_EQ(parsed.args[1].id, GREEDY_DUP_OPT_INPUT);
+    EXPECT_EQ(parsed.args[1].spelling, "tail");
 }
 
 TEST_CASE(option_kinds_parse_correctly) {
