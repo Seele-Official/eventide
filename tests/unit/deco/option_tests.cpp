@@ -339,6 +339,100 @@ OptTable make_filter_opt_table() {
     return OptTable(std::span<const Option>(kFilterOptInfos));
 }
 
+enum SkipOptionID {
+    SKIP_OPT_INVALID = 0,
+    SKIP_OPT_INPUT = 1,
+    SKIP_OPT_UNKNOWN = 2,
+    SKIP_OPT_VISIBLE_FLAG,      // -v   Flag, DefaultVis
+    SKIP_OPT_HIDDEN_FLAG,       // -x   Flag, kInternalVisibility
+    SKIP_OPT_HIDDEN_JOINED,     // -j   Joined, kInternalVisibility
+    SKIP_OPT_HIDDEN_SEPARATE,   // -o   Separate, kInternalVisibility
+    SKIP_OPT_HIDDEN_REMAINING,  // --rem RemainingArgs, kInternalVisibility
+    SKIP_OPT_GROUP_A,           // -a   Flag, kInternalVisibility
+    SKIP_OPT_GROUP_B,           // -b   Flag, DefaultVis
+    SKIP_OPT_HIDDEN_DUP,        // -d   Flag, kInternalVisibility (duplicate name)
+    SKIP_OPT_VISIBLE_DUP,       // -d   Flag, DefaultVis (duplicate name)
+};
+
+constexpr auto kSkipOptInfos = std::array{
+    Option::input(SKIP_OPT_INPUT),
+    Option::unknown(SKIP_OPT_UNKNOWN),
+    Option::unaliased_one(pfx_dash, "-v", SKIP_OPT_VISIBLE_FLAG, Kind::Flag, 0, "", ""),
+    Option::unaliased_one(pfx_dash,
+                          "-x",
+                          SKIP_OPT_HIDDEN_FLAG,
+                          Kind::Flag,
+                          0,
+                          "",
+                          "",
+                          0,
+                          0,
+                          kInternalVisibility),
+    Option::unaliased_one(pfx_dash,
+                          "-j",
+                          SKIP_OPT_HIDDEN_JOINED,
+                          Kind::Joined,
+                          1,
+                          "",
+                          "",
+                          0,
+                          0,
+                          kInternalVisibility),
+    Option::unaliased_one(pfx_dash,
+                          "-o",
+                          SKIP_OPT_HIDDEN_SEPARATE,
+                          Kind::Separate,
+                          1,
+                          "",
+                          "",
+                          0,
+                          0,
+                          kInternalVisibility),
+    Option::unaliased_one(pfx_double,
+                          "--rem",
+                          SKIP_OPT_HIDDEN_REMAINING,
+                          Kind::RemainingArgs,
+                          0,
+                          "",
+                          "",
+                          0,
+                          0,
+                          kInternalVisibility),
+    Option::unaliased_one(pfx_dash,
+                          "-a",
+                          SKIP_OPT_GROUP_A,
+                          Kind::Flag,
+                          0,
+                          "",
+                          "",
+                          0,
+                          0,
+                          kInternalVisibility),
+    Option::unaliased_one(pfx_dash, "-b", SKIP_OPT_GROUP_B, Kind::Flag, 0, "", ""),
+    Option::unaliased_one(pfx_dash,
+                          "-d",
+                          SKIP_OPT_HIDDEN_DUP,
+                          Kind::Flag,
+                          0,
+                          "",
+                          "",
+                          0,
+                          0,
+                          kInternalVisibility),
+    Option::unaliased_one(pfx_dash, "-d", SKIP_OPT_VISIBLE_DUP, Kind::Flag, 0, "", ""),
+};
+
+OptTable make_skip_opt_table() {
+    return OptTable(std::span<const Option>(kSkipOptInfos));
+}
+
+ParseOptions make_skip_parse_options() {
+    ParseOptions opts;
+    opts.visibility = DefaultVis;
+    opts.skip_excluded = true;
+    return opts;
+}
+
 enum KindsOptionID {
     KINDS_OPT_INVALID = 0,
     KINDS_OPT_INPUT = 1,
@@ -573,6 +667,119 @@ TEST_CASE(flag_filter_affects_matching) {
     EXPECT_TRUE(exclude_capture.errors.empty());
     ASSERT_EQ(exclude_capture.args.size(), 1U);
     EXPECT_EQ(exclude_capture.args[0].id, FILTER_OPT_UNKNOWN);
+}
+
+TEST_CASE(skip_excluded_hides_matches_and_values) {
+    auto table = make_skip_opt_table();
+    auto opts = make_skip_parse_options();
+
+    // Hidden options are consumed (with their full values) but never surface,
+    // and the surrounding inputs/options are unaffected.
+    auto parsed =
+        parse_all(table, split2vec("-v -x main.cc -jfoo -o out.o tail.cc --rem a b"), opts);
+    EXPECT_TRUE(parsed.errors.empty());
+    ASSERT_EQ(parsed.args.size(), 3U);
+    EXPECT_EQ(parsed.args[0].id, SKIP_OPT_VISIBLE_FLAG);
+    EXPECT_EQ(parsed.args[0].spelling, "-v");
+    EXPECT_EQ(parsed.args[1].id, SKIP_OPT_INPUT);
+    EXPECT_EQ(parsed.args[1].spelling, "main.cc");
+    EXPECT_EQ(parsed.args[2].id, SKIP_OPT_INPUT);
+    EXPECT_EQ(parsed.args[2].spelling, "tail.cc");
+}
+
+TEST_CASE(skip_excluded_default_off_preserves_unknown_behavior) {
+    auto table = make_skip_opt_table();
+    auto opts = make_skip_parse_options();
+    opts.skip_excluded = false;
+
+    // Without skip_excluded, hidden options degrade to unknown/input exactly
+    // as before this feature.
+    auto parsed = parse_all(table, split2vec("-x -jfoo -o out.o"), opts);
+    EXPECT_TRUE(parsed.errors.empty());
+    ASSERT_EQ(parsed.args.size(), 4U);
+    EXPECT_EQ(parsed.args[0].id, SKIP_OPT_UNKNOWN);
+    EXPECT_EQ(parsed.args[0].spelling, "-x");
+    EXPECT_EQ(parsed.args[1].id, SKIP_OPT_UNKNOWN);
+    EXPECT_EQ(parsed.args[1].spelling, "-jfoo");
+    EXPECT_EQ(parsed.args[2].id, SKIP_OPT_UNKNOWN);
+    EXPECT_EQ(parsed.args[2].spelling, "-o");
+    EXPECT_EQ(parsed.args[3].id, SKIP_OPT_INPUT);
+    EXPECT_EQ(parsed.args[3].spelling, "out.o");
+}
+
+TEST_CASE(skip_excluded_missing_value_is_silent) {
+    auto table = make_skip_opt_table();
+    auto opts = make_skip_parse_options();
+
+    // A hidden Separate option at end-of-argv must not report a missing-value
+    // error; it is simply consumed.
+    auto parsed = parse_all(table, split2vec("-o"), opts);
+    EXPECT_TRUE(parsed.errors.empty());
+    EXPECT_TRUE(parsed.args.empty());
+}
+
+TEST_CASE(skip_excluded_keeps_visible_missing_value_errors) {
+    auto table = make_proxy_opt_table();
+    auto opts = make_proxy_parse_options();
+    opts.skip_excluded = true;
+
+    // The visibility filter only silences excluded options; visible options
+    // still report missing values.
+    auto parsed = parse_all(table, split2vec("-p"), opts);
+    EXPECT_TRUE(parsed.args.empty());
+    ASSERT_EQ(parsed.errors.size(), 1U);
+    EXPECT_TRUE(std::string_view(parsed.errors[0].message).contains("missing"));
+}
+
+TEST_CASE(skip_excluded_grouped_short_options) {
+    auto table = make_skip_opt_table();
+    auto opts = make_skip_parse_options();
+    opts.grouped_short_options = true;
+
+    // "-ab" expands to hidden "-a" (consumed silently) + visible "-b".
+    auto parsed = parse_all(table, split2vec("-ab"), opts);
+    EXPECT_TRUE(parsed.errors.empty());
+    ASSERT_EQ(parsed.args.size(), 1U);
+    EXPECT_EQ(parsed.args[0].id, SKIP_OPT_GROUP_B);
+    EXPECT_EQ(parsed.args[0].spelling, "-b");
+}
+
+TEST_CASE(skip_excluded_visible_duplicate_wins) {
+    auto table = make_skip_opt_table();
+    auto opts = make_skip_parse_options();
+
+    // The hidden "-d" entry comes first in the table; the visible duplicate
+    // with the same spelling must still win instead of being swallowed.
+    auto parsed = parse_all(table, split2vec("-d"), opts);
+    EXPECT_TRUE(parsed.errors.empty());
+    ASSERT_EQ(parsed.args.size(), 1U);
+    EXPECT_EQ(parsed.args[0].id, SKIP_OPT_VISIBLE_DUP);
+    EXPECT_EQ(parsed.args[0].spelling, "-d");
+}
+
+TEST_CASE(skip_excluded_visible_duplicate_wins_tablegen) {
+    auto table = make_skip_opt_table();
+    table.tablegen_mode = true;
+    auto opts = make_skip_parse_options();
+
+    // Same as above but exercising the tablegen binary-search scan path used
+    // by catter's generated LLVM option tables.
+    auto parsed = parse_all(table, split2vec("-d"), opts);
+    EXPECT_TRUE(parsed.errors.empty());
+    ASSERT_EQ(parsed.args.size(), 1U);
+    EXPECT_EQ(parsed.args[0].id, SKIP_OPT_VISIBLE_DUP);
+}
+
+TEST_CASE(skip_excluded_all_duplicates_hidden) {
+    auto table = make_skip_opt_table();
+    auto opts = make_skip_parse_options();
+    // Neither duplicate carries this visibility bit, so both are excluded.
+    opts.visibility = kExperimentalFlag;
+
+    // When every duplicate is excluded, the argument is consumed silently.
+    auto parsed = parse_all(table, split2vec("-d"), opts);
+    EXPECT_TRUE(parsed.errors.empty());
+    EXPECT_TRUE(parsed.args.empty());
 }
 
 TEST_CASE(option_kinds_parse_correctly) {

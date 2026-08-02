@@ -41,6 +41,15 @@ struct ParseOptions {
     /// Exclude options that carry any of these flags.
     std::uint32_t exclude_flags = 0;
 
+    /// When an option is excluded (by visibility / include_flags /
+    /// exclude_flags), consume it exactly as if it were accepted but never
+    /// surface it in the parsed result and never report a missing-value error.
+    /// This makes excluded options truly invisible to the caller: their
+    /// separate/joined/remaining values are swallowed instead of leaking into
+    /// inputs or unknown options. Defaults to false to preserve the existing
+    /// behavior of treating excluded options as unknown.
+    bool skip_excluded = false;
+
     bool excludes(const OptionRef& opt) const;
 };
 

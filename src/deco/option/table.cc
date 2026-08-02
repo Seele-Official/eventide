@@ -20,6 +20,11 @@ namespace {
 
 enum class AcceptResult {
     Matched,
+    /// The argument matched an option that `ParseOptions::excludes` hides
+    /// while `skip_excluded` is enabled. The caller must consume the argument
+    /// (and any values the option takes) without producing a ParsedArg or a
+    /// parse error.
+    Excluded,
     NoMatch,
     MissingValue,
 };
@@ -267,6 +272,11 @@ struct ScanResult {
     ParsedArg out;
     std::uint32_t new_index = 0;
     const Option* fallback_flag = nullptr;
+    /// The accepted (or fallback) option was excluded by the parse options and
+    /// should be consumed silently when `skip_excluded` is enabled.
+    bool excluded = false;
+    /// Whether `fallback_flag` itself was excluded.
+    bool fallback_excluded = false;
 };
 
 /// Scan [range.begin, range.end) for the best option that accepts args[index].
@@ -293,8 +303,10 @@ ScanResult scan_and_accept(const OptTable& table,
     ScanResult result;
     std::uint32_t best_match_size = 0;
     std::uint32_t best_index = index;
+    bool best_excluded = false;
     std::uint32_t missing_match_size = 0;
     std::uint32_t missing_index = index;
+    bool missing_excluded = false;
 
     for(auto* it = begin; it != end; ++it) {
         auto arg_sz = match_opt(it, args[index], table.ignore_case);
@@ -302,7 +314,8 @@ ScanResult scan_and_accept(const OptTable& table,
             continue;
 
         OptionRef opt(*it, table);
-        if(options.excludes(opt))
+        const bool excluded = options.excludes(opt);
+        if(excluded && !options.skip_excluded)
             continue;
 
         std::uint32_t try_index = index;
@@ -311,44 +324,78 @@ ScanResult scan_and_accept(const OptTable& table,
 
         if(a == AcceptResult::Matched) {
             if(first_match) {
+                if(excluded) {
+                    // Keep scanning: a visible option with the same spelling
+                    // (e.g. duplicate names in a table) must win over this
+                    // excluded match. If no visible match exists, the last
+                    // recorded excluded result consumes the argument silently.
+                    if(!result.excluded || result.result == AcceptResult::MissingValue) {
+                        result.result = AcceptResult::Matched;
+                        result.excluded = true;
+                        result.out = try_out;
+                        result.new_index = try_index;
+                    }
+                    continue;
+                }
                 result.result = AcceptResult::Matched;
+                result.excluded = false;
                 result.out = try_out;
                 result.new_index = try_index;
                 return result;
             }
-            if(best_match_size < arg_sz) {
+            // Prefer visible matches over excluded ones of the same length.
+            if(best_match_size < arg_sz ||
+               (best_match_size == arg_sz && !excluded && best_excluded)) {
                 result.out = try_out;
                 best_match_size = arg_sz;
                 best_index = try_index;
+                best_excluded = excluded;
             }
             continue;
         }
 
-        if(arg_sz == 2 && it->kind == Kind::Flag)
+        if(arg_sz == 2 && it->kind == Kind::Flag) {
             result.fallback_flag = it;
+            result.fallback_excluded = excluded;
+        }
 
         if(try_index != index) {
             if(first_match) {
+                if(excluded) {
+                    if(!result.excluded) {
+                        result.result = AcceptResult::MissingValue;
+                        result.excluded = true;
+                        result.out.index = index;
+                        result.new_index = try_index;
+                    }
+                    continue;
+                }
                 result.result = AcceptResult::MissingValue;
+                result.excluded = false;
                 result.out.index = index;
                 result.new_index = try_index;
                 return result;
             }
-            if(missing_match_size < arg_sz) {
+            // Prefer visible matches over excluded ones of the same length.
+            if(missing_match_size < arg_sz ||
+               (missing_match_size == arg_sz && !excluded && missing_excluded)) {
                 missing_index = try_index;
                 missing_match_size = arg_sz;
+                missing_excluded = excluded;
             }
         }
     }
 
     if(best_match_size > 0) {
         result.result = AcceptResult::Matched;
+        result.excluded = best_excluded;
         result.new_index = best_index;
         return result;
     }
 
     if(missing_match_size != 0) {
         result.result = AcceptResult::MissingValue;
+        result.excluded = missing_excluded;
         result.out.index = index;
         result.new_index = missing_index;
     }
@@ -380,8 +427,9 @@ bool is_known_option(SearchRange range,
         }
 
         OptionRef opt(*s, table);
-        if(!options.excludes(opt))
-            return true;
+        if(options.excludes(opt))
+            return options.skip_excluded;
+        return true;
     }
     return false;
 }
@@ -421,6 +469,13 @@ int parse_step(const OptTable& table,
 
     auto range = search_range(table);
     auto scan = scan_and_accept(table, range, args, index, table.tablegen_mode, options);
+
+    if(scan.excluded) {
+        // The matching option is hidden by the parse options: consume the
+        // argument (and any values it takes) without yielding a result.
+        index = scan.new_index;
+        return static_cast<int>(AcceptResult::Excluded);
+    }
 
     if(scan.result == AcceptResult::Matched) {
         index = scan.new_index;
@@ -476,6 +531,12 @@ int parse_step_grouped(const OptTable& table,
 
     auto scan = scan_and_accept(table, range, args, index, true, options);
 
+    if(scan.excluded) {
+        index = scan.new_index;
+        group_buf.clear();
+        return static_cast<int>(AcceptResult::Excluded);
+    }
+
     if(scan.result == AcceptResult::Matched) {
         index = scan.new_index;
         out = scan.out;
@@ -507,6 +568,8 @@ int parse_step_grouped(const OptTable& table,
             auto remaining = str.substr(2);
             group_buf = "-";
             group_buf += remaining;
+            if(scan.fallback_excluded)
+                return static_cast<int>(AcceptResult::Excluded);
             return static_cast<int>(AcceptResult::Matched);
         }
     }
@@ -727,6 +790,11 @@ void ParseIter::advance() {
         if(is_grouped && !in_group) {
             ParsedArg out;
             auto result = parse_step_grouped(*table, args, index, out, group_buf, options);
+            if(result == static_cast<int>(AcceptResult::Excluded)) {
+                if(!group_buf.empty())
+                    in_group = true;
+                continue;
+            }
             if(result == static_cast<int>(AcceptResult::Matched)) {
                 if(!group_buf.empty())
                     in_group = true;
@@ -745,6 +813,13 @@ void ParseIter::advance() {
             auto result =
                 parse_step_grouped(*table, ArgsRef(buf_arr), buf_index, out, group_buf, options);
             out.index = index;
+            if(result == static_cast<int>(AcceptResult::Excluded)) {
+                if(group_buf.empty()) {
+                    in_group = false;
+                    ++index;
+                }
+                continue;
+            }
             if(result == static_cast<int>(AcceptResult::Matched)) {
                 if(group_buf.empty()) {
                     in_group = false;
@@ -760,6 +835,9 @@ void ParseIter::advance() {
         } else {
             ParsedArg out;
             auto result = parse_step(*table, args, index, out, options);
+            if(result == static_cast<int>(AcceptResult::Excluded)) {
+                continue;
+            }
             if(result == static_cast<int>(AcceptResult::Matched)) {
                 out.next_index = index;
                 current = out;

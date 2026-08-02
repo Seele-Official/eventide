@@ -354,11 +354,9 @@ if has_config("test") and has_config("ztest") then
 			add_files("tests/unit/async/**.cpp")
 			add_includedirs("examples/build_system")
 		end
-		if has_config("option") then
-			add_files("tests/unit/option/**.cpp")
-		end
-		if has_config("deco") and has_config("option") then
+		if has_config("deco") then
 			add_files("tests/unit/deco/**.cc")
+			add_files("tests/unit/deco/option_tests.cpp")
 		end
 		if has_config("codec") and has_config("codec_simdjson") then
 			add_files("tests/unit/codec/json/**.cpp")
